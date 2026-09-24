@@ -93,11 +93,13 @@ def record_keys(recs: pl.DataFrame) -> pl.DataFrame:
 
 def key_matrix(keys: pl.DataFrame, n_rows: int, max_df: int) -> sp.csr_matrix:
     """L2-normalised IDF-weighted key matrix (n_rows x vocabulary)."""
+    # Sorted vocabulary and sorted entries: group_by order varies between runs, and
+    # column order decides float summation order (hence tie-breaks) in the search.
     vocab = (keys.group_by("h").agg(pl.len().alias("df"))
              .filter((pl.col("df") >= 2) & (pl.col("df") <= max_df))
-             .with_row_index("col")
+             .sort("h").with_row_index("col")
              .with_columns((np.log(n_rows) - pl.col("df").log()).cast(pl.Float32).alias("w")))
-    kv = keys.join(vocab.select("h", "col", "w"), on="h")
+    kv = keys.join(vocab.select("h", "col", "w"), on="h").sort("row", "col")
     m = sp.csr_matrix((kv["w"].to_numpy(), (kv["row"].to_numpy(), kv["col"].to_numpy())),
                       shape=(n_rows, vocab.height), dtype=np.float32)
     del kv

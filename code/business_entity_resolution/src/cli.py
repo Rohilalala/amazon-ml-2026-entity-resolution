@@ -25,14 +25,15 @@ def _config(args) -> Config:
 
 
 def _train(args) -> pipeline.Bundle:
-    bundle = pipeline.train(args.data, _config(args), country_check=not args.skip_country_check)
+    bundle = pipeline.train(args.data, _config(args), country_check=not args.skip_country_check,
+                            cache=args.cache)
     bundle.save(args.model)
     return bundle
 
 
 def _predict(args, bundle=None) -> None:
     bundle = bundle or pipeline.Bundle.load(args.model)
-    _, matches, cands, report = pipeline.predict(args.data, bundle)
+    _, matches, cands, report = pipeline.predict(args.data, bundle, cache=args.cache)
     data.write_id_lists(args.out / "matching_results.tsv", data.MATCH_COLUMN, matches)
     data.write_id_lists(args.out / "candidate_pairs.tsv", data.CANDIDATE_COLUMN, cands)
     (args.model / "predict_report.json").write_text(json.dumps(report, indent=2))
@@ -47,6 +48,8 @@ def main(argv=None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
         p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
+        p.add_argument("--cache", type=Path, default=None,
+                       help="reuse prepared records and candidates across runs (keyed on data, settings and code)")
         if name != "train":
             p.add_argument("--out", type=Path, required=True, help="output folder for the TSVs")
         if name != "predict":

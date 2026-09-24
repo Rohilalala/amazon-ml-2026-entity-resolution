@@ -23,7 +23,9 @@ combination keys are built from those integers, in chunks of records, so the
 key table costs 12 bytes per key whatever the text length.
 """
 import logging
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import polars as pl
@@ -37,7 +39,9 @@ MAX_NAME_TOKENS = 5
 MAX_NUMBERS = 3
 MAX_ADDR_WORDS = 5
 KEY_CHUNK = 500_000
-SEARCH_CHUNK = 4000
+SEARCH_CHUNK = 2000
+# scipy releases the GIL inside sparse products, so chunks run in parallel threads.
+SEARCH_THREADS = min(8, os.cpu_count() or 1)
 # Hash seeds keep the key families apart (a name token never equals a number key).
 SEED = {"n": 11, "d": 12, "a": 13, "c": 14, "nn": 21, "dn": 22, "da": 23, "na": 24}
 
@@ -114,15 +118,16 @@ def _top_k(s: sp.csr_matrix, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray
 def search(q: sp.csr_matrix, t: sp.csr_matrix, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Top-k rows of `t` for every row of `q` by cosine (rows are unit vectors)."""
     tt = t.T.tocsr()
-    rows, cols, vals = [], [], []
-    for s in range(0, q.shape[0], SEARCH_CHUNK):
+
+    def chunk(s):
         r, c, v = _top_k((q[s:s + SEARCH_CHUNK] @ tt).tocsr(), k)
-        rows.append(r + s)
-        cols.append(c)
-        vals.append(v)
-    if not rows:
+        return r + s, c, v
+
+    with ThreadPoolExecutor(SEARCH_THREADS) as pool:
+        res = list(pool.map(chunk, range(0, q.shape[0], SEARCH_CHUNK)))
+    if not res:
         return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.float32)
-    return np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+    return tuple(np.concatenate(x) for x in zip(*res))
 
 
 def generate(recs: pl.DataFrame, k: int, k_rev: int, max_df: int) -> pl.DataFrame:
@@ -143,20 +148,25 @@ def generate(recs: pl.DataFrame, k: int, k_rev: int, max_df: int) -> pl.DataFram
             # Local frame: Source 1 rows first, then the target source.
             local = pl.concat([q_rows, t_rows])
             glob = local["row"].to_numpy()
-            m = key_matrix(record_keys(local.with_columns(pl.int_range(pl.len(), dtype=pl.UInt32).alias("row"))),
-                           local.height, max_df)
+            keys = record_keys(local.with_columns(pl.int_range(pl.len(), dtype=pl.UInt32).alias("row")))
+            t_keys = time.time()
+            m = key_matrix(keys, local.height, max_df)
+            del keys
+            t_matrix = time.time()
             nq = q_rows.height
             q, t = m[:nq], m[nq:]
             del m
             r, c, v = search(q, t, k)
+            t_fwd = time.time()
             parts.append(pl.DataFrame({"i": glob[r], "j": glob[nq + c], "score": v},
                                       schema={"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32}))
             if k_rev:
                 r, c, v = search(t, q, k_rev)
                 parts.append(pl.DataFrame({"i": glob[c], "j": glob[nq + r], "score": v},
                                           schema={"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32}))
-            log.info("blocking %s / source %d: %d + %d records, %d keys in vocabulary, %.1fs",
-                     country, s, nq, t_rows.height, q.shape[1], time.time() - t0)
+            log.info("blocking %s / source %d: %d + %d records, %d keys in vocabulary; keys %.0fs, "
+                     "matrix %.0fs, forward %.0fs, reverse %.0fs", country, s, nq, t_rows.height, q.shape[1],
+                     t_keys - t0, t_matrix - t_keys, t_fwd - t_matrix, time.time() - t_fwd)
     if not parts:
         return pl.DataFrame(schema={"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32})
     return pl.concat(parts).group_by("i", "j").agg(pl.col("score").max()).sort("i", "j")

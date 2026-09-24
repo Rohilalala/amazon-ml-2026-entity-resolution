@@ -157,3 +157,15 @@ def test_expected_f05_rule_keeps_the_best_prefix_or_nothing():
     assert keep.tolist() == [True, True, False, False]  # group 1 is probably a singleton
     keep = pipeline.expected_f05_mask(np.array([5, 5, 2]), np.array([0.3, 0.95, 0.6]), 0.2)
     assert keep.tolist() == [False, True, True]
+
+
+def test_cached_run_matches_uncached(dataset, trained, tmp_path):
+    model_dir, out = trained
+    cache = tmp_path / "cache"
+    for n in (1, 2):  # first run fills the cache, second reads it
+        dest = tmp_path / f"out{n}"
+        assert cli.main(["predict", "--data", str(dataset), "--model", str(model_dir),
+                         "--out", str(dest), "--cache", str(cache)]) == 0
+        for name in ("matching_results.tsv", "candidate_pairs.tsv"):
+            assert (dest / name).read_bytes() == (out / name).read_bytes()
+    assert len(list(cache.iterdir())) == 1

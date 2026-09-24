@@ -5,3 +5,6 @@ artifacts/
 student_resource/
 *.zip
 .DS_Store
+logs/
+cache/
+output_v*/

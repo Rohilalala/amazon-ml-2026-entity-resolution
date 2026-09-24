@@ -42,8 +42,27 @@ def peak_gb() -> float:
     return peak / (1 << 30) if sys.platform == "darwin" else peak / (1 << 20)
 
 
-def candidate_table(raw: pl.DataFrame, cfg: Config) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Prepared records and their candidate pairs with retrieval-context features."""
+def _cache_key(inputs: dict, cfg: Config) -> str:
+    """Identifies a candidate table: input file hashes, blocking settings and the
+    source of every module that shapes records or candidates."""
+    h = hashlib.sha256(json.dumps([inputs, cfg.k, cfg.k_rev, cfg.max_df], sort_keys=True).encode())
+    for module in (candidates, features, sys.modules[features.text.__name__]):
+        h.update(Path(module.__file__).read_bytes())
+    return h.hexdigest()[:16]
+
+
+def candidate_table(raw: pl.DataFrame, cfg: Config, inputs: dict,
+                    cache: Path | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Prepared records and their candidate pairs with retrieval-context features.
+
+    With `cache`, results are stored under a key derived from the input hashes,
+    the blocking settings and the code, and reused when all of them match.
+    """
+    where = cache / _cache_key(inputs, cfg) if cache else None
+    if where and (where / "pairs.parquet").is_file():
+        recs, pairs = pl.read_parquet(where / "recs.parquet"), pl.read_parquet(where / "pairs.parquet")
+        log.info("loaded %d records and %d candidate pairs from cache %s", recs.height, pairs.height, where)
+        return recs, pairs
     t0 = time.time()
     recs = features.prepare(raw)
     log.info("normalised %d records in %.1fs (peak %.1f GB)", recs.height, time.time() - t0, peak_gb())
@@ -52,6 +71,12 @@ def candidate_table(raw: pl.DataFrame, cfg: Config) -> tuple[pl.DataFrame, pl.Da
     pairs = features.add_group_features(pairs, recs["src"].to_numpy())
     log.info("%d candidate pairs (%.1f per Source 1 record) in %.1fs (peak %.1f GB)", pairs.height,
              pairs.height / max(1, (recs["src"] == 1).sum()), time.time() - t0, peak_gb())
+    if where:
+        where.mkdir(parents=True, exist_ok=True)
+        recs.write_parquet(where / "recs.parquet")
+        pairs.write_parquet(where / ".pairs.parquet")
+        (where / ".pairs.parquet").rename(where / "pairs.parquet")  # marks the entry complete
+        log.info("cached candidate table in %s", where)
     return recs, pairs
 
 
@@ -165,6 +190,7 @@ class Bundle:
     rule: dict
     boosters: list[lgb.Booster]
     report: dict
+    oof: pl.DataFrame | None = None  # out-of-fold predictions, saved for error analysis
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Mean probability of the fold models."""
@@ -180,6 +206,8 @@ class Bundle:
         meta = {"config": self.config.to_dict(), "features": self.features,
                 "rule": self.rule, "models": files, "report": self.report}
         (directory / BUNDLE_FILE).write_text(json.dumps(meta, indent=2))
+        if self.oof is not None:
+            self.oof.write_parquet(directory / "oof.parquet")
         log.info("saved bundle to %s", directory)
 
     @classmethod
@@ -219,13 +247,14 @@ def provenance(data_dir: Path, split: str) -> dict:
 
 # ---------------------------------------------------------------- entry points
 
-def train(data_dir: Path, cfg: Config, country_check: bool = True) -> Bundle:
+def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path | None = None) -> Bundle:
     """Candidates for the whole training split, a matcher cross-validated on a
     sample of Source 1 records, and the decision rule that maximises macro F0.5."""
     t_start = time.time()
     raw = data.load_split(data_dir, "train")
     truth = data.load_truth(data_dir / "train" / "train_ground_truth.tsv", raw)
-    recs, pairs = candidate_table(raw, cfg)
+    prov = provenance(data_dir, "train")
+    recs, pairs = candidate_table(raw, cfg, prov["inputs"], cache)
     del raw
     pairs = pairs.join(truth.with_columns(pl.lit(1, dtype=pl.Int8).alias("y")), on=["i", "j"], how="left") \
         .with_columns(pl.col("y").fill_null(0))
@@ -271,13 +300,16 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True) -> Bundle:
         "oof_f05": round(score, 5), "rule": rule, "rule_trials": trials, "oof_f05_by_country": by_country,
         "fold_rounds": [b.best_iteration for b in boosters],
         "feature_gain": dict(sorted(zip(names, gain.round(1).tolist()), key=lambda kv: -kv[1])),
-        "provenance": provenance(data_dir, "train"),
+        "provenance": prov,
     }
     if country_check:
         report["unseen_country"] = _country_transfer(X, y, codes, n_true, country, cfg,
                                                      max(1, int(np.mean(report["fold_rounds"]))), rule)
     report["train_seconds"] = round(time.time() - t_start, 1)
-    return Bundle(cfg, names, rule, boosters, report)
+    bundle = Bundle(cfg, names, rule, boosters, report)
+    bundle.oof = table.select("i", "j", "y").with_columns(
+        pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes))
+    return bundle
 
 
 def _blocking_report(pairs: pl.DataFrame, n_true: pl.DataFrame) -> dict:
@@ -319,11 +351,13 @@ def _country_transfer(X, y, codes, n_true, country, cfg, rounds, rule) -> dict:
     return out
 
 
-def predict(data_dir: Path, bundle: Bundle) -> tuple[pl.Series, pl.DataFrame, pl.DataFrame, dict]:
+def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None
+            ) -> tuple[pl.Series, pl.DataFrame, pl.DataFrame, dict]:
     """Matches and candidates for every test Source 1 record, checked against the
     submission rules. Returns (ids, match lists, candidate lists, report)."""
     raw = data.load_split(data_dir, "test")
-    recs, pairs = candidate_table(raw, bundle.config)
+    prov = provenance(data_dir, "test")
+    recs, pairs = candidate_table(raw, bundle.config, prov["inputs"], cache)
     del raw
     t0 = time.time()
     prob = np.concatenate([bundle.predict(matrix(f, bundle.features))
@@ -350,5 +384,5 @@ def predict(data_dir: Path, bundle: Bundle) -> tuple[pl.Series, pl.DataFrame, pl
         log.info("test %s: %s", c, v)
     report = {"predicted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "test_s1": len(ids),
               "test_pairs": pairs.height, "matched_pairs": matched.height, "by_country": by_country,
-              "provenance": provenance(data_dir, "test")}
+              "provenance": prov}
     return ids, match_lists, cand_lists, report

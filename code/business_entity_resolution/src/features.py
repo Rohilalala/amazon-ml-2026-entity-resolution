@@ -6,7 +6,7 @@ country it has not seen in training (France in the test set).
 import numpy as np
 import polars as pl
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 from . import text
 
@@ -98,6 +98,29 @@ def _jaccard(a: pl.Series, b: pl.Series) -> np.ndarray:
         return np.where(union > 0, inter / union, np.nan).astype(np.float32)
 
 
+def _house_features(a: pl.Series, b: pl.Series) -> dict:
+    """House-number agreement beyond equality. Decoy records copy the name and
+    street of a real business with a nearby number (228 vs 249, 6654 vs 665),
+    while true duplicates tend to differ by padding or a typo (01694 vs 1694)."""
+    missing = ((a == "") | (b == "")).to_numpy()
+    na = a.str.extract(r"(\d+)", 1).str.slice(0, 9)
+    nb = b.str.extract(r"(\d+)", 1).str.slice(0, 9)
+    xa = na.cast(pl.Int64, strict=False).to_numpy().astype(np.float64)
+    xb = nb.cast(pl.Int64, strict=False).to_numpy().astype(np.float64)
+    sa, sb = na.str.strip_chars_start("0").fill_null(""), nb.str.strip_chars_start("0").fill_null("")
+    lev = _fuzzy(sa.to_list(), sb.to_list(), Levenshtein.normalized_similarity, 1.0)
+    inside = np.array([(x != y) and bool(x) and bool(y) and (x in y or y in x)
+                       for x, y in zip(sa.to_list(), sb.to_list())], dtype=np.float32)
+    nan = np.float32(np.nan)
+    return {
+        "house_match": np.where(missing, nan, (a == b).to_numpy()).astype(np.float32),
+        "house_num_eq": np.where(missing, nan, (sa == sb).to_numpy()).astype(np.float32),
+        "house_lev": np.where(missing, nan, lev).astype(np.float32),
+        "house_logdiff": np.where(missing, nan, np.log1p(np.abs(xa - xb))).astype(np.float32),
+        "house_inside": np.where(missing, nan, inside).astype(np.float32),
+    }
+
+
 def pair_features(recs: pl.DataFrame, pairs: pl.DataFrame) -> pl.DataFrame:
     """String-similarity features for one chunk of pairs, plus the context
     columns already on `pairs`. `recs` is the prepared frame (row-aligned)."""
@@ -131,8 +154,9 @@ def pair_features(recs: pl.DataFrame, pairs: pl.DataFrame) -> pl.DataFrame:
     f["jac_addr"] = _jaccard(ta["addr_tok"], tb["addr_tok"])
     f["jac_num"] = _jaccard(ta["nums"], tb["nums"])
     f["shared_num"] = ta["nums"].list.set_intersection(tb["nums"]).list.len().to_numpy().astype(np.float32)
-    ha, hb = a["house"].to_numpy(), b["house"].to_numpy()
-    f["house_match"] = np.where((ha == "") | (hb == ""), np.nan, ha == hb).astype(np.float32)
+    f.update(_house_features(a["house"], b["house"]))
+    f["n_nums_1"] = ta["nums"].list.len().to_numpy().astype(np.float32)
+    f["n_nums_2"] = tb["nums"].list.len().to_numpy().astype(np.float32)
     joined_a, joined_b = a["core"].str.replace_all(" ", ""), b["core"].str.replace_all(" ", "")
     f["acr_match"] = (((a["acr"] != "") & (a["acr"] == joined_b))
                       | ((b["acr"] != "") & (b["acr"] == joined_a))).to_numpy().astype(np.float32)

@@ -5,6 +5,7 @@ metrics, data fingerprints). Prediction only reads the Bundle, so the test run
 uses exactly the settings that were validated.
 """
 import hashlib
+import inspect
 import json
 import logging
 import platform
@@ -46,8 +47,10 @@ def _cache_key(inputs: dict, cfg: Config) -> str:
     """Identifies a candidate table: input file hashes, blocking settings and the
     source of every module that shapes records or candidates."""
     h = hashlib.sha256(json.dumps([inputs, cfg.k, cfg.k_rev, cfg.max_df], sort_keys=True).encode())
-    for module in (candidates, features, sys.modules[features.text.__name__]):
+    for module in (candidates, sys.modules[features.text.__name__]):
         h.update(Path(module.__file__).read_bytes())
+    for fn in (features._prepare_chunk, features.prepare, features.competition, features.add_group_features):
+        h.update(inspect.getsource(fn).encode())
     return h.hexdigest()[:16]
 
 

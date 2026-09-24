@@ -20,9 +20,8 @@ log = logging.getLogger("ber")
 
 
 def _config(args) -> Config:
-    base = Config()
-    return Config(k=args.k, k_rev=args.k_rev, block_by_country=not args.no_country_blocking,
-                  folds=args.folds, seed=args.seed, lgb_params=base.lgb_params)
+    return Config(k=args.k, k_rev=args.k_rev, max_df=args.max_df, train_s1_sample=args.sample,
+                  folds=args.folds, seed=args.seed)
 
 
 def _train(args) -> pipeline.Bundle:
@@ -33,9 +32,9 @@ def _train(args) -> pipeline.Bundle:
 
 def _predict(args, bundle=None) -> None:
     bundle = bundle or pipeline.Bundle.load(args.model)
-    ids, matches, cands, report = pipeline.predict(args.data, bundle)
-    data.write_ids(args.out / "matching_results.tsv", data.MATCH_COLUMN, ids, matches)
-    data.write_ids(args.out / "candidate_pairs.tsv", data.CANDIDATE_COLUMN, ids, cands)
+    _, matches, cands, report = pipeline.predict(args.data, bundle)
+    data.write_id_lists(args.out / "matching_results.tsv", data.MATCH_COLUMN, matches)
+    data.write_id_lists(args.out / "candidate_pairs.tsv", data.CANDIDATE_COLUMN, cands)
     (args.model / "predict_report.json").write_text(json.dumps(report, indent=2))
     log.info("wrote %s", args.out)
 
@@ -52,11 +51,12 @@ def main(argv=None) -> int:
             p.add_argument("--out", type=Path, required=True, help="output folder for the TSVs")
         if name != "predict":
             d = Config()
-            p.add_argument("--k", type=int, default=d.k)
-            p.add_argument("--k-rev", type=int, default=d.k_rev)
+            p.add_argument("--k", type=int, default=d.k, help="candidates per Source 1 record and source")
+            p.add_argument("--k-rev", type=int, default=d.k_rev, help="Source 1 candidates per Source 2/3 record")
+            p.add_argument("--max-df", type=int, default=d.max_df, help="skip blocking keys more common than this")
+            p.add_argument("--sample", type=int, default=d.train_s1_sample, help="Source 1 records used to train")
             p.add_argument("--folds", type=int, default=d.folds)
             p.add_argument("--seed", type=int, default=d.seed)
-            p.add_argument("--no-country-blocking", action="store_true")
             p.add_argument("--skip-country-check", action="store_true",
                            help="skip the leave-one-country-out estimate")
     args = ap.parse_args(argv)

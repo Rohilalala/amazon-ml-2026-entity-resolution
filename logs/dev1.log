@@ -1,0 +1,5 @@
+2026-09-25 02:25:50,783 INFO src.data: train_source1.tsv: 2206821 records
+2026-09-25 02:25:51,459 INFO src.data: train_source2.tsv: 5034616 records
+2026-09-25 02:25:52,073 INFO src.data: train_source3.tsv: 5285603 records
+2026-09-25 02:25:55,052 INFO src.data: ground truth: 2206821 Source 1 rows, 7638365 true pairs, 0 Source 2/3 records matched to more than one Source 1 record
+2026-09-25 02:27:31,957 INFO src.pipeline: normalised 12527040 records in 96.9s (peak 6.6 GB)

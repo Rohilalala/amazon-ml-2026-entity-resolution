@@ -1,6 +1,6 @@
 """Training and prediction: blocking -> pair features -> LightGBM -> decision rule.
 
-Training produces a Bundle (fold models, feature list, tuned threshold, config,
+Training produces a Bundle (fold models, feature list, decision rule, config,
 metrics, data fingerprints). Prediction only reads the Bundle, so the test run
 uses exactly the settings that were validated.
 """
@@ -8,7 +8,9 @@ import hashlib
 import json
 import logging
 import platform
+import resource
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from importlib import metadata
@@ -16,110 +18,142 @@ from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
-import pandas as pd
+import polars as pl
 from sklearn.model_selection import GroupKFold
 
 from . import candidates, data, features
 from .config import Config
-from .metric import f05_macro
+from .metric import f05_counts
 
 log = logging.getLogger(__name__)
 
-ID_COLS = ("s1", "cand")
 THRESHOLDS = np.round(np.arange(0.05, 0.96, 0.01), 2)
+MISSED_GRID = (0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
 BUNDLE_FILE = "bundle.json"
-PACKAGES = ("numpy", "pandas", "scikit-learn", "scipy", "lightgbm", "rapidfuzz")
+PACKAGES = ("numpy", "polars", "scipy", "scikit-learn", "lightgbm", "rapidfuzz", "anyascii")
+NON_FEATURES = {"i", "j", "y", "jsrc", "prob"}
 
 
 # ---------------------------------------------------------------- stages
 
-def pair_table(recs: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Prepared records and the feature table of their candidate pairs."""
+def peak_gb() -> float:
+    """Peak resident memory of this process so far, in GB."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1 << 30) if sys.platform == "darwin" else peak / (1 << 20)
+
+
+def candidate_table(raw: pl.DataFrame, cfg: Config) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Prepared records and their candidate pairs with retrieval-context features."""
     t0 = time.time()
-    recs = features.prepare(recs)
-    mats = features.matrices(recs)
-    pairs = candidates.generate(recs, [mats["name"], mats["full"]], cfg.k, cfg.k_rev,
-                                cfg.block_by_country)
-    table = features.build(recs, mats, pairs)
-    log.info("%d candidate pairs, %d features in %.1fs",
-             len(table), table.shape[1] - len(ID_COLS), time.time() - t0)
-    return recs, table
+    recs = features.prepare(raw)
+    log.info("normalised %d records in %.1fs (peak %.1f GB)", recs.height, time.time() - t0, peak_gb())
+    t0 = time.time()
+    pairs = candidates.generate(recs, cfg.k, cfg.k_rev, cfg.max_df)
+    pairs = features.add_group_features(pairs, recs["src"].to_numpy())
+    log.info("%d candidate pairs (%.1f per Source 1 record) in %.1fs (peak %.1f GB)", pairs.height,
+             pairs.height / max(1, (recs["src"] == 1).sum()), time.time() - t0, peak_gb())
+    return recs, pairs
 
 
-def source1_ids(recs: pd.DataFrame) -> list[str]:
-    return recs.loc[recs["src"] == 1, "entity_id"].tolist()
+def feature_chunks(recs: pl.DataFrame, pairs: pl.DataFrame, size: int):
+    """Yield feature frames for consecutive chunks of `pairs`."""
+    for s in range(0, pairs.height, size):
+        yield features.pair_features(recs, pairs.slice(s, size))
 
 
-def labels(pairs: pd.DataFrame, truth: dict) -> np.ndarray:
-    """1 where the candidate is a true match of the Source 1 record."""
-    empty = frozenset()
-    return np.fromiter((c in truth.get(s, empty) for s, c in zip(pairs["s1"], pairs["cand"])),
-                       dtype=np.int8, count=len(pairs))
+def build_features(recs, pairs, size) -> pl.DataFrame:
+    t0 = time.time()
+    out = pl.concat(list(feature_chunks(recs, pairs, size))) if pairs.height else pairs
+    log.info("features for %d pairs in %.1fs (peak %.1f GB)", pairs.height, time.time() - t0, peak_gb())
+    return out
 
 
-def best_for_cand(pairs: pd.DataFrame, prob: np.ndarray) -> np.ndarray:
-    """True where a pair has the top probability among all Source 1 records
-    competing for the same Source 2/3 record."""
-    top = pd.Series(prob, index=pairs.index).groupby(pairs["cand"].to_numpy()).transform("max")
-    return prob >= top.to_numpy()
-
-
-def decide(pairs: pd.DataFrame, prob: np.ndarray, threshold: float, exclusive: bool) -> dict:
-    """Final matches {s1: frozenset(cands)}: probability >= threshold and, when
-    `exclusive`, each Source 2/3 record assigned to its best Source 1 record only."""
-    keep = prob >= threshold
-    if exclusive:
-        keep &= best_for_cand(pairs, prob)
-    return pairs.loc[keep].groupby("s1")["cand"].agg(frozenset).to_dict()
-
-
-def tune(pairs, prob, y, truth, ids) -> tuple[float, float, bool]:
-    """(macro F0.5, threshold, exclusive) maximising the metric on `ids`.
-
-    Vectorised form of metric.f05_macro: per Source 1 entity, predicted and
-    correct counts come from bincount instead of set operations. Train()
-    cross-checks the winner against the reference implementation.
-    """
-    codes = pd.Index(ids).get_indexer(pairs["s1"])
-    inside = codes >= 0
-    codes, prob, y = codes[inside], prob[inside], y[inside]
-    n_true = np.array([len(truth.get(i, ())) for i in ids], dtype=float)
-    best = best_for_cand(pairs[inside], prob)
-    results = []
-    for exclusive in (True, False):
-        for t in THRESHOLDS:
-            sel = (prob >= t) & best if exclusive else prob >= t
-            n_pred = np.bincount(codes, weights=sel, minlength=len(ids))
-            tp = np.bincount(codes, weights=sel & (y == 1), minlength=len(ids))
-            with np.errstate(divide="ignore", invalid="ignore"):
-                p, r = tp / n_pred, tp / n_true
-                f = np.where(tp > 0, 1.25 * p * r / (0.25 * p + r), 0.0)
-            f = np.where(n_true == 0, (n_pred == 0).astype(float), f)
-            results.append((float(f.mean()), float(t), exclusive))
-    return max(results)
+def matrix(frame: pl.DataFrame, names: list[str]) -> np.ndarray:
+    return frame.select(names).to_numpy().astype(np.float32, copy=False)
 
 
 def fit(X, y, cfg: Config, valid=None, rounds=None) -> lgb.Booster:
     """One LightGBM model: early-stopped on `valid`, or a fixed number of rounds."""
-    train_set = lgb.Dataset(X, y, free_raw_data=False)
+    train_set = lgb.Dataset(X, y, free_raw_data=True)
     if valid is None:
         return lgb.train(cfg.lgb(), train_set, rounds)
     return lgb.train(cfg.lgb(), train_set, cfg.num_boost_round,
-                     valid_sets=[lgb.Dataset(*valid, reference=train_set)],
+                     valid_sets=[lgb.Dataset(valid[0], valid[1], reference=train_set)],
                      callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)])
 
 
 def cross_validate(X, y, groups, cfg: Config) -> tuple[np.ndarray, list[lgb.Booster]]:
-    """Out-of-fold probabilities, folds grouped by Source 1 entity so no entity's
+    """Out-of-fold probabilities, folds grouped by Source 1 record so no record's
     pairs are split between training and validation."""
-    oof, boosters = np.zeros(len(y)), []
+    oof, boosters = np.zeros(len(y), dtype=np.float64), []
     splitter = GroupKFold(n_splits=cfg.folds, shuffle=True, random_state=cfg.seed)
     for n, (tr, va) in enumerate(splitter.split(X, y, groups)):
-        b = fit(X.iloc[tr], y[tr], cfg, valid=(X.iloc[va], y[va]))
-        oof[va] = b.predict(X.iloc[va], num_iteration=b.best_iteration)
+        t0 = time.time()
+        b = fit(X[tr], y[tr], cfg, valid=(X[va], y[va]))
+        oof[va] = b.predict(X[va], num_iteration=b.best_iteration)
         boosters.append(b)
-        log.info("fold %d/%d: %d rounds", n + 1, cfg.folds, b.best_iteration)
+        log.info("fold %d/%d: %d rounds in %.0fs", n + 1, cfg.folds, b.best_iteration, time.time() - t0)
     return oof, boosters
+
+
+def macro_f05(codes, n_true, keep, y) -> float:
+    """Macro F0.5 over entities 0..len(n_true)-1 for the pairs selected by `keep`.
+    `codes` maps each pair to its entity; `y` marks true pairs."""
+    n = len(n_true)
+    n_pred = np.bincount(codes, weights=keep, minlength=n)
+    tp = np.bincount(codes, weights=keep & (y == 1), minlength=n)
+    return float(f05_counts(n_pred, n_true, tp).mean())
+
+
+def owner_mask(pairs: pl.DataFrame, prob: np.ndarray) -> np.ndarray:
+    """True where the pair is the most likely owner of its Source 2/3 record."""
+    top = pl.DataFrame({"j": pairs["j"], "p": prob}).select(pl.col("p").max().over("j"))["p"].to_numpy()
+    return prob >= top
+
+
+def expected_f05_mask(group: np.ndarray, prob: np.ndarray, missed: float) -> np.ndarray:
+    """Per Source 1 record, keep the top-k candidates that maximise expected F0.5.
+
+    With candidates sorted by probability p1 >= p2 >= ..., keeping the top k scores
+    E[F] ~ 1.25 * (p1 + .. + pk) / (0.25 * (sum(p) + missed) + k), where `missed`
+    is the expected number of true matches blocking did not retrieve. Keeping
+    nothing scores 1 only for a singleton: E[F] ~ prod(1 - p) when `missed` is 0,
+    shrunk by exp(-missed). The best k (possibly 0) is chosen per record.
+    """
+    df = pl.DataFrame({"g": group, "p": prob, "idx": np.arange(len(prob))}).sort(["g", "p"], descending=[False, True])
+    df = df.with_columns(
+        k=pl.int_range(1, pl.len() + 1).over("g"),
+        cum=pl.col("p").cum_sum().over("g"),
+        total=pl.col("p").sum().over("g"),
+        none=((1 - pl.col("p")).clip(1e-12).log().sum().over("g").exp() * np.exp(-missed)),
+    ).with_columns(ef=1.25 * pl.col("cum") / (0.25 * (pl.col("total") + missed) + pl.col("k")))
+    df = df.with_columns(best=pl.col("ef").max().over("g"))
+    best_k = pl.when(pl.col("best") > pl.col("none")).then(
+        pl.col("k").filter(pl.col("ef") == pl.col("best")).first().over("g")).otherwise(0)
+    keep_sorted = df.select(pl.col("k") <= best_k)["k"].to_numpy()
+    keep = np.zeros(len(prob), dtype=bool)
+    keep[df["idx"].to_numpy()] = keep_sorted
+    return keep
+
+
+def apply_rule(rule: dict, group: np.ndarray, prob: np.ndarray) -> np.ndarray:
+    """Pairs kept by a decision rule: a global probability threshold, or the
+    per-record expected-F0.5 selection."""
+    if rule["kind"] == "threshold":
+        return prob >= rule["threshold"]
+    return expected_f05_mask(group, prob, rule["missed"])
+
+
+def choose_rule(codes, n_true, prob, y) -> tuple[float, dict, list]:
+    """Best decision rule on out-of-fold probabilities: every global threshold
+    and several expected-F0.5 settings are scored with the exact metric."""
+    trials = [(macro_f05(codes, n_true, prob >= t, y), {"kind": "threshold", "threshold": float(t)})
+              for t in THRESHOLDS]
+    trials += [(macro_f05(codes, n_true, expected_f05_mask(codes, prob, m), y),
+                {"kind": "expected_f05", "missed": m}) for m in MISSED_GRID]
+    best = max(trials, key=lambda t: t[0])
+    top = sorted(trials, key=lambda t: -t[0])[:5]
+    return best[0], best[1], [{"f05": round(f, 5), **r} for f, r in top]
 
 
 # ---------------------------------------------------------------- bundle
@@ -128,14 +162,12 @@ def cross_validate(X, y, groups, cfg: Config) -> tuple[np.ndarray, list[lgb.Boos
 class Bundle:
     config: Config
     features: list[str]
-    threshold: float
-    exclusive: bool
+    rule: dict
     boosters: list[lgb.Booster]
     report: dict
 
-    def predict(self, table: pd.DataFrame) -> np.ndarray:
+    def predict(self, X: np.ndarray) -> np.ndarray:
         """Mean probability of the fold models."""
-        X = table[self.features]
         return np.mean([b.predict(X, num_iteration=b.best_iteration) for b in self.boosters], axis=0)
 
     def save(self, directory: Path) -> None:
@@ -146,8 +178,7 @@ class Bundle:
             b.save_model(directory / name, num_iteration=b.best_iteration)
             files.append(name)
         meta = {"config": self.config.to_dict(), "features": self.features,
-                "threshold": self.threshold, "exclusive": self.exclusive,
-                "models": files, "report": self.report}
+                "rule": self.rule, "models": files, "report": self.report}
         (directory / BUNDLE_FILE).write_text(json.dumps(meta, indent=2))
         log.info("saved bundle to %s", directory)
 
@@ -159,16 +190,16 @@ class Bundle:
         meta = json.loads(path.read_text())
         boosters = [lgb.Booster(model_file=str(directory / f)) for f in meta["models"]]
         for b in boosters:
-            if b.feature_name() != meta["features"]:
+            if b.num_feature() != len(meta["features"]):
                 raise data.DataError(f"{directory}: model features do not match the bundle")
-        return cls(Config.from_dict(meta["config"]), meta["features"], meta["threshold"],
-                   meta["exclusive"], boosters, meta["report"])
+        return cls(Config.from_dict(meta["config"]), meta["features"], meta["rule"],
+                   boosters, meta["report"])
 
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
+        for block in iter(lambda: fh.read(1 << 22), b""):
             h.update(block)
     return h.hexdigest()
 
@@ -188,107 +219,136 @@ def provenance(data_dir: Path, split: str) -> dict:
 
 # ---------------------------------------------------------------- entry points
 
-def _per_country(pairs, prob, t, exclusive, truth, ids, country_of) -> dict:
-    pred = decide(pairs, prob, t, exclusive)
-    out = {}
-    for c in sorted({country_of[i] for i in ids}):
-        sub = [i for i in ids if country_of[i] == c]
-        out[c] = {"s1": len(sub), "f05": round(f05_macro(pred, truth, sub), 5)}
+def train(data_dir: Path, cfg: Config, country_check: bool = True) -> Bundle:
+    """Candidates for the whole training split, a matcher cross-validated on a
+    sample of Source 1 records, and the decision rule that maximises macro F0.5."""
+    t_start = time.time()
+    raw = data.load_split(data_dir, "train")
+    truth = data.load_truth(data_dir / "train" / "train_ground_truth.tsv", raw)
+    recs, pairs = candidate_table(raw, cfg)
+    del raw
+    pairs = pairs.join(truth.with_columns(pl.lit(1, dtype=pl.Int8).alias("y")), on=["i", "j"], how="left") \
+        .with_columns(pl.col("y").fill_null(0))
+
+    s1 = recs.filter(pl.col("src") == 1).select("row", "country_key")
+    n_true_all = s1.join(truth.group_by("i").len("n_true"), left_on="row", right_on="i", how="left") \
+        .with_columns(pl.col("n_true").fill_null(0))
+    blocking = _blocking_report(pairs, n_true_all)
+
+    # Sample Source 1 records for the matcher; their candidates come from the full pool.
+    sample = n_true_all.sample(min(cfg.train_s1_sample, n_true_all.height), seed=cfg.seed).sort("row")
+    code_of = np.full(recs.height, -1, dtype=np.int64)
+    code_of[sample["row"].to_numpy()] = np.arange(sample.height)
+    sp = pairs.filter(pl.col("i").is_in(sample["row"].implode()))
+    table = build_features(recs, sp, cfg.feature_chunk)
+    names = [c for c in table.columns if c not in NON_FEATURES]
+    X, y = matrix(table, names), table["y"].to_numpy()
+    codes = code_of[table["i"].to_numpy()]
+    n_true = sample["n_true"].to_numpy()
+    log.info("training sample: %d Source 1 records, %d pairs, %d features, %d positives",
+             sample.height, len(y), len(names), int(y.sum()))
+
+    oof, boosters = cross_validate(X, y, codes, cfg)
+    score, rule, trials = choose_rule(codes, n_true, oof, y)
+    log.info("out-of-fold macro F0.5 %.4f with rule %s; best trials %s", score, rule, trials)
+
+    country = sample["country_key"].to_numpy()
+    keep = apply_rule(rule, codes, oof)
+    by_country = {}
+    for c in np.unique(country):
+        ent = np.flatnonzero(country == c)
+        mask = np.isin(codes, ent)
+        remap = np.full(sample.height, -1)
+        remap[ent] = np.arange(len(ent))
+        by_country[str(c)] = round(macro_f05(remap[codes[mask]], n_true[ent], keep[mask], y[mask]), 5)
+    log.info("out-of-fold macro F0.5 by country: %s", by_country)
+
+    gain = np.mean([b.feature_importance("gain") for b in boosters], axis=0)
+    report = {
+        "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "blocking": blocking,
+        "sample_s1": sample.height, "sample_pairs": len(y), "sample_positives": int(y.sum()),
+        "oof_f05": round(score, 5), "rule": rule, "rule_trials": trials, "oof_f05_by_country": by_country,
+        "fold_rounds": [b.best_iteration for b in boosters],
+        "feature_gain": dict(sorted(zip(names, gain.round(1).tolist()), key=lambda kv: -kv[1])),
+        "provenance": provenance(data_dir, "train"),
+    }
+    if country_check:
+        report["unseen_country"] = _country_transfer(X, y, codes, n_true, country, cfg,
+                                                     max(1, int(np.mean(report["fold_rounds"]))), rule)
+    report["train_seconds"] = round(time.time() - t_start, 1)
+    return Bundle(cfg, names, rule, boosters, report)
+
+
+def _blocking_report(pairs: pl.DataFrame, n_true: pl.DataFrame) -> dict:
+    """Pair recall and the F0.5 a perfect matcher could reach on these candidates."""
+    found = pairs.filter(pl.col("y") == 1).group_by("i").len("found")
+    t = n_true.join(found, left_on="row", right_on="i", how="left").with_columns(pl.col("found").fill_null(0))
+    ceiling = f05_counts(t["found"], t["n_true"], t["found"])
+    out = {"pairs": pairs.height, "pairs_per_s1": round(pairs.height / t.height, 2),
+           "pair_recall": round(t["found"].sum() / max(1, t["n_true"].sum()), 5),
+           "f05_ceiling": round(float(ceiling.mean()), 5), "by_country": {}}
+    for c in t["country_key"].unique().sort():
+        m = (t["country_key"] == c).to_numpy()
+        out["by_country"][c] = {"pair_recall": round(t["found"].filter(m).sum() / max(1, t["n_true"].filter(m).sum()), 5),
+                                "f05_ceiling": round(float(ceiling[m].mean()), 5)}
+    log.info("blocking: %s", out)
     return out
 
 
-def _country_transfer(pairs, X, y, truth, ids, country_of, cfg, rounds, t, exclusive) -> dict:
-    """Leave-one-country-out: train on the other countries, score the held-out
-    one at the tuned threshold. Estimates quality on a country never seen in
-    training (the test set adds France)."""
-    s1_country = pairs["s1"].map(country_of).to_numpy()
+def _country_transfer(X, y, codes, n_true, country, cfg, rounds, rule) -> dict:
+    """Leave-one-country-out on the training sample: train on the other countries,
+    score the held-out one. Estimates quality on a country never seen in training
+    (the test set adds France)."""
+    pair_country = country[codes]
     out = {}
-    for c in sorted(set(s1_country)):
-        held = s1_country == c
+    for c in np.unique(country):
+        held = pair_country == c
         if held.all():
             continue
         b = fit(X[~held], y[~held], cfg, rounds=rounds)
         prob = b.predict(X[held])
-        sub = [i for i in ids if country_of[i] == c]
-        pred = decide(pairs[held], prob, t, exclusive)
-        oracle = tune(pairs[held], prob, y[held], truth, sub)
-        out[c] = {"f05_at_tuned_threshold": round(f05_macro(pred, truth, sub), 5),
-                  "f05_best_threshold": round(oracle[0], 5), "best_threshold": oracle[1]}
-        log.info("unseen-country check, held out %s: F0.5 %.4f (best possible %.4f at %.2f)",
-                 c, out[c]["f05_at_tuned_threshold"], oracle[0], oracle[1])
+        ent = np.flatnonzero(country == c)
+        remap = np.full(len(country), -1)
+        remap[ent] = np.arange(len(ent))
+        cc, nt = remap[codes[held]], n_true[ent]
+        best = choose_rule(cc, nt, prob, y[held])
+        out[str(c)] = {"f05_with_chosen_rule": round(macro_f05(cc, nt, apply_rule(rule, cc, prob), y[held]), 5),
+                       "f05_best_rule": round(best[0], 5), "best_rule": best[1]}
+        log.info("unseen-country check, held out %s: %s", c, out[str(c)])
     return out
 
 
-def train(data_dir: Path, cfg: Config, country_check: bool = True) -> Bundle:
-    """Build training pairs, cross-validate, tune the decision rule, return a Bundle."""
+def predict(data_dir: Path, bundle: Bundle) -> tuple[pl.Series, pl.DataFrame, pl.DataFrame, dict]:
+    """Matches and candidates for every test Source 1 record, checked against the
+    submission rules. Returns (ids, match lists, candidate lists, report)."""
+    raw = data.load_split(data_dir, "test")
+    recs, pairs = candidate_table(raw, bundle.config)
+    del raw
     t0 = time.time()
-    recs = data.load_split(data_dir, "train")
-    truth = data.load_truth(data_dir / "train" / "train_ground_truth.tsv", recs)
-    recs, pairs = pair_table(recs, cfg)
-    ids = source1_ids(recs)
-    country_of = dict(zip(recs["entity_id"], recs["country_key"]))
-    y = labels(pairs, truth)
+    prob = np.concatenate([bundle.predict(matrix(f, bundle.features))
+                           for f in feature_chunks(recs, pairs, bundle.config.feature_chunk)]) \
+        if pairs.height else np.zeros(0)
+    log.info("scored %d pairs in %.1fs", pairs.height, time.time() - t0)
+    if bundle.config.exclusive:
+        prob = np.where(owner_mask(pairs, prob), prob, 0.0)
+    keep = apply_rule(bundle.rule, pairs["i"].to_numpy(), prob) & (prob > 0)
+    matched = pairs.select("i", "j").filter(pl.Series(keep))
 
-    n_true = sum(map(len, truth.values()))
-    cross = sum(1 for s, ms in truth.items() for m in ms if country_of[m] != country_of[s])
-    ceiling = f05_macro(pairs[y == 1].groupby("s1")["cand"].agg(frozenset).to_dict(), truth, ids)
-    recall = float(y.sum() / n_true) if n_true else 1.0
-    log.info("blocking: pair recall %.4f (%d of %d true pairs), F0.5 ceiling %.4f, "
-             "%d true pairs cross countries", recall, int(y.sum()), n_true, ceiling, cross)
+    id_of = recs["entity_id"].to_numpy()
+    s1 = recs.filter(pl.col("src") == 1)
+    ids = s1["entity_id"]
+    match_lists = data.id_lists(ids, matched, id_of)
+    cand_lists = data.id_lists(ids, pairs.select("i", "j"), id_of)
+    data.check_submission(ids, match_lists, cand_lists)
 
-    feats = [c for c in pairs.columns if c not in ID_COLS]
-    X = pairs[feats]
-    oof, boosters = cross_validate(X, y, pairs["s1"].to_numpy(), cfg)
-    score, threshold, exclusive = tune(pairs, oof, y, truth, ids)
-    reference = f05_macro(decide(pairs, oof, threshold, exclusive), truth, ids)
-    if abs(score - reference) > 1e-9:
-        raise RuntimeError(f"tuned score {score} != reference metric {reference}")
-    log.info("out-of-fold macro F0.5 %.4f at threshold %.2f (exclusive=%s)",
-             score, threshold, exclusive)
-
-    rounds = max(1, int(np.mean([b.best_iteration for b in boosters])))
-    report = {
-        "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "train_s1": len(ids), "train_pairs": len(pairs), "positives": int(y.sum()),
-        "pair_recall": round(recall, 5), "f05_ceiling": round(ceiling, 5),
-        "cross_country_true_pairs": cross,
-        "oof_f05": round(score, 5),
-        "oof_by_country": _per_country(pairs, oof, threshold, exclusive, truth, ids, country_of),
-        "fold_rounds": [b.best_iteration for b in boosters],
-        "feature_gain": dict(sorted(
-            zip(feats, np.mean([b.feature_importance("gain") for b in boosters], axis=0).round(1).tolist()),
-            key=lambda kv: -kv[1])),
-        "provenance": provenance(data_dir, "train"),
-    }
-    if country_check:
-        report["unseen_country"] = _country_transfer(pairs, X, y, truth, ids, country_of, cfg,
-                                                     rounds, threshold, exclusive)
-    report["train_seconds"] = round(time.time() - t0, 1)
-    return Bundle(cfg, feats, threshold, exclusive, boosters, report)
-
-
-def predict(data_dir: Path, bundle: Bundle) -> tuple[list[str], dict, dict, dict]:
-    """Test-set matches and candidates, checked against the submission rules."""
-    recs = data.load_split(data_dir, "test")
-    recs, pairs = pair_table(recs, bundle.config)
-    ids = source1_ids(recs)
-    prob = bundle.predict(pairs) if len(pairs) else np.zeros(0)
-    matches = decide(pairs, prob, bundle.threshold, bundle.exclusive)
-    cands = pairs.groupby("s1")["cand"].agg(frozenset).to_dict()
-    data.check_submission(ids, matches, cands, set(recs.loc[recs["src"] != 1, "entity_id"]))
-
-    country_of = dict(zip(recs["entity_id"], recs["country_key"]))
-    by_country = {}
-    for c in sorted({country_of[i] for i in ids}):
-        sub = [i for i in ids if country_of[i] == c]
-        n = [len(matches.get(i, ())) for i in sub]
-        by_country[c] = {"s1": len(sub), "with_matches": int(np.count_nonzero(n)),
-                         "matched_ids": int(sum(n)),
-                         "with_candidates": sum(1 for i in sub if cands.get(i))}
-    report = {"predicted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "test_s1": len(ids),
-              "test_pairs": len(pairs), "by_country": by_country,
-              "provenance": provenance(data_dir, "test")}
+    counts = s1.select("row", "country_key").join(
+        matched.group_by("i").len("n"), left_on="row", right_on="i", how="left").with_columns(pl.col("n").fill_null(0))
+    by_country = {c: {"s1": g.height, "with_matches": int((g["n"] > 0).sum()), "matched_ids": int(g["n"].sum())}
+                  for (c,), g in counts.group_by(["country_key"], maintain_order=True)}
     for c, v in by_country.items():
-        log.info("test %s: %d S1 records, %d with matches, %d matched ids",
-                 c, v["s1"], v["with_matches"], v["matched_ids"])
-    return ids, matches, cands, report
+        log.info("test %s: %s", c, v)
+    report = {"predicted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "test_s1": len(ids),
+              "test_pairs": pairs.height, "matched_pairs": matched.height, "by_country": by_country,
+              "provenance": provenance(data_dir, "test")}
+    return ids, match_lists, cand_lists, report

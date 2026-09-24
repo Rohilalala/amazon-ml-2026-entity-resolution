@@ -9,13 +9,14 @@ from dataclasses import asdict, dataclass, field
 def _default_lgb_params():
     return {
         "objective": "binary",
-        "learning_rate": 0.05,
-        "num_leaves": 63,
-        "min_data_in_leaf": 40,
+        "learning_rate": 0.08,
+        "num_leaves": 127,
+        "min_data_in_leaf": 100,
         "feature_fraction": 0.8,
         "bagging_fraction": 0.8,
         "bagging_freq": 1,
         "lambda_l2": 1.0,
+        "max_bin": 255,
         "deterministic": True,
         "force_row_wise": True,
         "verbose": -1,
@@ -24,16 +25,23 @@ def _default_lgb_params():
 
 @dataclass(frozen=True)
 class Config:
-    # Blocking: nearest Source 2/3 records kept per Source 1 record (per source,
-    # per similarity matrix), and nearest Source 1 records per Source 2/3 record.
-    k: int = 15
+    # Blocking: top-k Source 2 and top-k Source 3 records per Source 1 record,
+    # top-k_rev Source 1 records per Source 2/3 record, and the document
+    # frequency above which a blocking key is too common to use.
+    k: int = 10
     k_rev: int = 3
-    block_by_country: bool = True
-    # Training.
+    max_df: int = 1000
+    # Training: Source 1 records sampled for the matcher (their candidates
+    # come from the full pool), cross-validation folds, feature chunk size.
+    train_s1_sample: int = 400_000
     folds: int = 5
+    feature_chunk: int = 1_000_000
     seed: int = 42
     num_boost_round: int = 3000
     early_stopping_rounds: int = 100
+    # Decision: each Source 2/3 record goes to its most likely Source 1 record
+    # only (the training ground truth never assigns one record to two).
+    exclusive: bool = True
     lgb_params: dict = field(default_factory=_default_lgb_params)
 
     def to_dict(self):

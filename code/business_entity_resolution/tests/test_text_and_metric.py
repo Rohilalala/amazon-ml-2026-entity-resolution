@@ -1,39 +1,63 @@
+import random
+
+import polars as pl
 import pytest
 
 from src import text
-from src.metric import f05_entity, f05_macro
+from src.metric import f05_counts, f05_entity, f05_macro
+
+
+def one(fn, value):
+    return fn(pl.Series([value])).item()
 
 
 @pytest.mark.parametrize("raw, expected", [
     ("Tata Consultancy Svcs Pvt. Ltd.", "tata consultancy services private limited"),
     ("Café Élysée SARL", "cafe elysee sarl"),
-    ("Joe's Pizza d/b/a Joe Slice", "joes pizza dba joe slice"),
+    ("Joe's Pizza d/b/a Joe Slice", "joes pizza d b a joe slice"),
     ("Smith & Sons Co.", "smith and sons company"),
+    ("*** Sai Tech Private Limited", "sai technologies private limited"),
     ("", ""),
 ])
 def test_clean_name(raw, expected):
-    assert text.clean_name(raw) == expected
+    assert one(text.clean_name, raw) == expected
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("1427 14th Street, Omaha, NE", "1427 14 street omaha ne"),
+    ("S.F.S FLAT NO-1-59, NEW DELHI", "s f s flat no 159 new dl"),
+    ("18220 68th St, Phoenix, Arizona", "18220 68 street phoenix az"),
+    ("Sector-22D, Noida, Uttar Pradesh", "sector 22d noida up"),
+    ("Ohio Texas West Virginia", "oh tx wv"),
+    ("<NULL>", ""),
+    ("None", ""),
+    ("HOME CENTER, <NULL>, KOZHIKODE, N/A", "home center kozhikode"),
+    ("5 Rue de l'Église, Lyon", "5 rue de leglise lyon"),
+])
+def test_clean_address(raw, expected):
+    assert one(text.clean_address, raw) == expected
 
 
 def test_core_name_drops_legal_forms_and_falls_back():
-    assert text.core_name(text.clean_name("The Smith & Co.")) == "smith"
-    assert text.core_name(text.clean_name("Café Élysée SARL")) == "cafe elysee"
-    assert text.core_name("limited") == "limited"  # nothing left -> keep the name
+    names = text.clean_name(pl.Series(["The Smith & Co.", "Café Élysée SARL", "Limited", "M/s Jai Traders"]))
+    assert text.core_name(names).to_list() == ["smith", "cafe elysee", "limited", "jai traders"]
 
 
-def test_clean_address_rejoins_pin_and_expands():
-    assert text.clean_address("12, M.G. Rd, Bengaluru 560 001") == "12 m g road bengaluru 560001"
-    assert text.clean_address("5 Rue de l'Église, Lyon") == "5 rue de leglise lyon"
+def test_transliterated_name_shares_skeleton_with_english_spelling():
+    hindi = text.core_name(text.clean_name(pl.Series(["जय हेल्थकेयर प्राइवेट लिमिटेड"])))
+    english = text.core_name(text.clean_name(pl.Series(["Jai Healthcare Private Limited"])))
+    assert text.skeleton_string(hindi).item() == text.skeleton_string(english).item()
 
 
-def test_numbers_postcodes_house_acronym():
-    nums = text.numbers("12 main street 94105 suite 200")
-    assert nums == {"12", "94105", "200"}
-    assert text.postcodes(nums) == {"94105"}
-    assert text.house_number("12 main street") == "12"
-    assert text.house_number("near sbi atm") == ""
-    assert text.acronym("tata consultancy services") == "tcs"
-    assert text.acronym("infosys") == ""
+def test_website_name_matches_concatenated_core_name():
+    core = pl.Series(["quality ace culture"])
+    site = text.core_name(text.clean_name(pl.Series(["qualityaceculture.com"])))
+    assert text.concat_skeleton(core).item() == text.concat_skeleton(site).item()
+
+
+def test_acronym_and_non_latin():
+    assert text.acronym(pl.Series(["tata consultancy services", "infosys"])).to_list() == ["tcs", ""]
+    assert text.is_non_latin(pl.Series(["राम", "Élysée", "abc"])).to_list() == [True, False, False]
 
 
 def test_metric_matches_problem_statement_example():
@@ -48,7 +72,14 @@ def test_metric_singletons_and_misses():
     assert f05_entity({"S2-2"}, {"S2-1"}) == 0.0
 
 
-def test_macro_counts_entities_missing_from_prediction():
-    truth = {"a": frozenset({"S2-1"}), "b": frozenset()}
-    assert f05_macro({}, truth, ["a", "b"]) == 0.5
-    assert f05_macro({"a": {"S2-1"}}, truth, ["a", "b"]) == 1.0
+def test_vectorised_metric_agrees_with_reference():
+    rng = random.Random(0)
+    pool = [f"S2-{n}" for n in range(8)]
+    ids, pred, truth = [], {}, {}
+    for n in range(300):
+        ids.append(n)
+        truth[n] = frozenset(rng.sample(pool, rng.randint(0, 3)))
+        pred[n] = frozenset(rng.sample(pool, rng.randint(0, 3)))
+    counts = f05_counts([len(pred[i]) for i in ids], [len(truth[i]) for i in ids],
+                        [len(pred[i] & truth[i]) for i in ids])
+    assert counts.mean() == pytest.approx(f05_macro(pred, truth, ids))

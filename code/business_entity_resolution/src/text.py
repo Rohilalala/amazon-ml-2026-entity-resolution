@@ -1,11 +1,16 @@
-"""Normalisation helpers for business names and addresses.
+"""Vectorised normalisation of business names and addresses (polars).
 
 Every record from every source goes through the same functions, so the
 abbreviation maps only need to be consistent, not exhaustive: if both sides
 map "Rd" and "Road" to "road", the comparison sees the same token.
+
+Non-Latin scripts (Devanagari, Malayalam, Kannada, ...) are transliterated to
+ASCII first; the phonetic `skeleton` then absorbs most spelling differences
+between a transliteration and the English spelling
+("helthkeyr" / "healthcare" -> "ltkr").
 """
-import re
-import unicodedata
+import polars as pl
+from anyascii import anyascii
 
 # Token-level expansions for business names.
 NAME_ABBREV = {
@@ -20,17 +25,18 @@ NAME_ABBREV = {
     "tech": "technologies", "techs": "technologies", "sys": "systems",
     "engg": "engineering", "mktg": "marketing", "univ": "university",
     "hosp": "hospital", "ctr": "center", "centre": "center", "cntr": "center",
-    "trdg": "trading", "dept": "department",
+    "trdg": "trading", "dept": "department", "ets": "etablissements",
 }
 
-# Legal forms and filler words dropped to get a "core" name.
-NAME_STOP = {
-    "private", "limited", "llp", "llc", "lp", "plc", "incorporated",
-    "corporation", "company", "companies", "the", "and", "of",
+# Legal forms, honorifics and filler words dropped to get a "core" name.
+NAME_STOP = [
+    "private", "limited", "llp", "llc", "lp", "plc", "incorporated", "corporation",
+    "company", "companies", "the", "and", "of", "formerly", "dba", "aka",
+    "com", "www", "net", "org", "in", "ms", "m", "s", "shri", "sri", "shree", "smt",
     # French legal forms and articles (France appears only in the test set).
     "sarl", "sas", "sasu", "sa", "eurl", "snc", "sci", "et", "de", "la", "le",
     "les", "du", "des", "d", "l",
-}
+]
 
 # Token-level expansions for addresses.
 ADDR_ABBREV = {
@@ -43,63 +49,130 @@ ADDR_ABBREV = {
     "nr": "near", "opp": "opposite", "mkt": "market", "ngr": "nagar",
     "sec": "sector", "sect": "sector", "clny": "colony", "soc": "society",
     "hsg": "housing", "dist": "district", "distt": "district",
-    "n": "north", "s": "south", "e": "east", "w": "west",
-    "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest",
-    "chem": "chemin", "imp": "impasse", "fbg": "faubourg",
+    "chem": "chemin", "imp": "impasse", "fbg": "faubourg", "fg": "faubourg",
+    "mt": "mount", "ft": "fort", "pt": "point",
 }
 
-_TOKEN = re.compile(r"[a-z0-9]+")
-_DBA = re.compile(r"\bd\s*/\s*b\s*/\s*a\b|\bd\.b\.a\b\.?")
-_SPLIT_PIN = re.compile(r"\b(\d{3})\s+(\d{3})\b")  # "560 001" -> "560001"
-_DIGITS = re.compile(r"\d+")
+# State / union-territory names -> postal codes, so "Arizona" and "AZ" (or
+# "Uttar Pradesh" and "UP") compare equal. Applied to whole phrases before the
+# token expansions above; both sides pass through the same maps.
+STATES = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca",
+    "colorado": "co", "connecticut": "ct", "delaware": "de", "florida": "fl", "georgia": "ga",
+    "hawaii": "hi", "idaho": "id", "illinois": "il", "indiana": "in", "iowa": "ia",
+    "kansas": "ks", "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv", "new hampshire": "nh",
+    "new jersey": "nj", "new mexico": "nm", "new york": "ny", "north carolina": "nc",
+    "north dakota": "nd", "ohio": "oh", "oklahoma": "ok", "oregon": "or", "pennsylvania": "pa",
+    "rhode island": "ri", "south carolina": "sc", "south dakota": "sd", "tennessee": "tn",
+    "texas": "tx", "utah": "ut", "vermont": "vt", "virginia": "va", "washington": "wa",
+    "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy", "district of columbia": "dc",
+    "andhra pradesh": "ap", "arunachal pradesh": "arp", "assam": "as", "bihar": "br",
+    "chhattisgarh": "cg", "chattisgarh": "cg", "goa": "ga", "gujarat": "gj", "haryana": "hr",
+    "himachal pradesh": "hp", "jharkhand": "jh", "karnataka": "ka", "kerala": "kl",
+    "keralam": "kl", "madhya pradesh": "mp", "maharashtra": "mh", "manipur": "mn",
+    "meghalaya": "ml", "mizoram": "mz", "nagaland": "nl", "odisha": "od", "orissa": "od",
+    "punjab": "pb", "rajasthan": "rj", "sikkim": "sk", "tamil nadu": "tn", "tamilnadu": "tn",
+    "telangana": "ts", "tripura": "tr", "uttar pradesh": "up", "uttarakhand": "uk",
+    "uttaranchal": "uk", "west bengal": "wb", "delhi": "dl", "jammu and kashmir": "jk",
+    "ladakh": "la", "chandigarh": "ch", "puducherry": "py", "pondicherry": "py",
+    "andaman and nicobar islands": "an", "lakshadweep": "ld",
+}
+
+_PLACEHOLDER = r"(?i)<null>|\bn/a\b|^\s*(none|null|nan|na)\s*$"
 
 
-def to_ascii(s):
-    """Lower-case and strip accents (é -> e) so transliterations line up."""
-    return unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+def transliterate(s: pl.Series) -> pl.Series:
+    """ASCII transliteration; only non-ASCII strings pay the Python-level cost."""
+    idx = s.str.contains(r"[^\x00-\x7F]").arg_true()
+    if len(idx) == 0:
+        return s
+    return s.scatter(idx, s.gather(idx).map_elements(anyascii, return_dtype=pl.String))
 
 
-def _clean(s, abbrev):
-    """Shared cleaning: ASCII, '&' -> 'and', drop punctuation, expand tokens."""
-    s = to_ascii(s).replace("&", " and ").replace("'", "")
-    s = _DBA.sub(" dba ", s)
-    return " ".join(abbrev.get(t, t) for t in _TOKEN.findall(s))
+def is_non_latin(s: pl.Series) -> pl.Series:
+    """True for strings containing letters outside Latin/Latin-1 (e.g. Indic scripts)."""
+    return s.str.contains(r"[^\x00-\x{024F}]")
 
 
-def clean_name(s):
-    """Normalised business name with abbreviations expanded."""
-    return _clean(s, NAME_ABBREV)
+def clean(s: pl.Series) -> pl.Series:
+    """Lower-case ASCII, placeholders ('<NULL>', 'N/A', 'None') removed, '&' -> 'and',
+    apostrophes dropped, other punctuation -> single spaces."""
+    s = transliterate(s.fill_null("")).str.to_lowercase()
+    s = s.str.replace_all(_PLACEHOLDER, " ")
+    s = s.str.replace_all("&", " and ").str.replace_all("'", "")
+    # Glue digit runs split by noise ("1-59", "560 001" stay distinct, "22-d" -> "22d").
+    s = s.str.replace_all(r"(\d)[-/.](\d)", "$1$2")
+    s = s.str.replace_all(r"(\d)(st|nd|rd|th)\b", "$1")  # ordinals: 14th -> 14
+    return s.str.replace_all(r"[^a-z0-9]+", " ").str.strip_chars()
 
 
-def clean_address(s):
-    """Normalised address; split 6-digit PIN codes are re-joined first."""
-    return _clean(_SPLIT_PIN.sub(r"\1\2", to_ascii(s)), ADDR_ABBREV)
+def expand(s: pl.Series, mapping: dict) -> pl.Series:
+    """Replace whole tokens using `mapping` (e.g. 'rd' -> 'road')."""
+    return s.str.split(" ").list.eval(pl.element().replace(mapping)).list.join(" ")
 
 
-def core_name(name):
-    """Name without legal suffixes and filler words (falls back to the full name)."""
-    core = [t for t in name.split() if t not in NAME_STOP]
-    return " ".join(core) if core else name
+def replace_phrases(s: pl.Series, mapping: dict) -> pl.Series:
+    """Replace whole multi-word phrases (longest first). Spaces are doubled so two
+    adjacent phrases ('ohio texas') each keep their own boundary."""
+    padded = pl.select(pl.concat_str([pl.lit(" "), pl.lit(s).str.replace_all(" ", "  "), pl.lit(" ")])).to_series()
+    keys = sorted(mapping, key=len, reverse=True)  # leftmost-first: longest phrase wins
+    out = padded.str.replace_many([f" {k.replace(' ', '  ')} " for k in keys],
+                                  [f" {mapping[k]} " for k in keys], leftmost=True)
+    return out.str.replace_all(" +", " ").str.strip_chars()
 
 
-def numbers(address):
-    """All digit runs in an address (house numbers, postcodes, sector numbers)."""
-    return frozenset(_DIGITS.findall(address))
+def clean_name(s: pl.Series) -> pl.Series:
+    return expand(clean(s), NAME_ABBREV)
 
 
-def house_number(address):
-    """First digit run in an address, or '' when there is none."""
-    m = _DIGITS.search(address)
-    return m.group() if m else ""
+def clean_address(s: pl.Series) -> pl.Series:
+    return expand(replace_phrases(clean(s), STATES), ADDR_ABBREV)
 
 
-def postcodes(nums):
-    """5-digit (US ZIP, French code postal) and 6-digit (Indian PIN) numbers."""
-    return frozenset(n for n in nums if len(n) in (5, 6))
+def core_name(name: pl.Series) -> pl.Series:
+    """Name without legal forms, honorifics and fillers (falls back to the full name).
+    Stop words are also matched by skeleton, which catches transliterated forms
+    ('praivet' -> 'prvt' = skeleton of 'private')."""
+    e = pl.element()
+    core = name.str.split(" ").list.eval(
+        e.filter((e != "") & ~e.is_in(NAME_STOP) & ~skeleton(e).is_in(_STOP_SKELETONS))).list.join(" ")
+    return pl.select(pl.when(core == "").then(name).otherwise(core)).to_series()
 
 
-def acronym(name):
-    """Initials of a multi-word name, e.g. 'tata consultancy services' -> 'tcs'."""
-    toks = name.split()
-    return "".join(t[0] for t in toks) if len(toks) >= 2 else ""
+def skeleton(e: pl.Expr) -> pl.Expr:
+    """Phonetic skeleton of a token: c/q->k, z->s, w->v, x->ks, ph->f, 'h' and vowels
+    dropped, repeated consonants collapsed. Digits pass through unchanged."""
+    e = (e.str.replace_all("ph", "f").str.replace_all("[cq]", "k").str.replace_all("z", "s")
+         .str.replace_all("w", "v").str.replace_all("x", "ks").str.replace_all("h", "")
+         .str.replace_all("[aeiouy]", ""))
+    for ch in "bdfgjklmnprstv":
+        e = e.str.replace_all(ch + "+", ch)
+    return e
 
+
+# Skeletons of long legal words only; short ones ('smt' for Smt., 't' for 'the')
+# would also remove real words such as 'Smith'.
+_STOP_SKELETONS = pl.select(skeleton(pl.lit(pl.Series(
+    ["private", "limited", "company", "companies", "corporation", "incorporated", "formerly"]
+)))).to_series().to_list()
+
+
+def skeleton_string(s: pl.Series) -> pl.Series:
+    """Skeleton applied token by token to a whole string."""
+    return s.str.split(" ").list.eval(skeleton(pl.element())).list.join(" ")
+
+
+def concat_skeleton(core: pl.Series) -> pl.Series:
+    """Skeleton of the core name written without spaces; equals the skeleton of a
+    website-style name ('qualityaceculture.com') built from the same words."""
+    return pl.select(skeleton(pl.lit(core).str.replace_all(" ", ""))).to_series()
+
+
+def acronym(core: pl.Series) -> pl.Series:
+    """Initials of multi-word names ('tata consultancy services' -> 'tcs'), else ''."""
+    toks = core.str.split(" ")
+    return pl.select(pl.when(toks.list.len() >= 2)
+                     .then(toks.list.eval(pl.element().str.slice(0, 1)).list.join(""))
+                     .otherwise(pl.lit(""))).to_series()

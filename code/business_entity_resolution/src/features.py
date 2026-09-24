@@ -69,6 +69,23 @@ def add_group_features(pairs: pl.DataFrame, src_of: np.ndarray) -> pl.DataFrame:
     )
 
 
+def probability_context(pairs: pl.DataFrame) -> pl.DataFrame:
+    """Second-stage features from first-stage probabilities `p1` (row order kept):
+    how the pair compares with the other candidates of its Source 1 record and
+    with the other Source 1 records competing for its Source 2/3 record."""
+    second = (pairs.select("j", "p1").sort(["j", "p1"], descending=[False, True])
+              .group_by("j", maintain_order=True).agg(pl.col("p1").slice(1, 1).first().alias("second_c")))
+    out = competition(pairs.select("i", "j", "p1"), "p1", "p1").join(
+        second, on="j", how="left", maintain_order="left")
+    return out.with_columns(
+        pl.col("p1").sum().over("i").cast(pl.Float32).alias("sum_s1_p1"),
+        (pl.col("p1") > 0.5).sum().over("i").cast(pl.Float32).alias("n_s1_p1_over_half"),
+        pl.col("p1").sum().over("j").cast(pl.Float32).alias("sum_c_p1"),
+        pl.when(pl.col("rank_c_p1") == 1).then(pl.col("p1") - pl.col("second_c").fill_null(0.0))
+        .otherwise(-pl.col("gap_c_p1")).cast(pl.Float32).alias("margin_c_p1"),
+    ).drop("second_c")
+
+
 def _fuzzy(a: list, b: list, scorer, scale: float = 100.0) -> np.ndarray:
     return process.cpdist(a, b, scorer=scorer, workers=-1, dtype=np.float32) / scale
 

@@ -38,6 +38,9 @@ class Config:
     feature_chunk: int = 1_000_000
     seed: int = 42
     num_boost_round: int = 3000
+    # 2 = a second matcher that also sees how each pair's stage-1 probability
+    # compares with its competitors on both sides.
+    stages: int = 2
     early_stopping_rounds: int = 100
     # Decision: each Source 2/3 record goes to its most likely Source 1 record
     # only (the training ground truth never assigns one record to two).

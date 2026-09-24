@@ -31,7 +31,7 @@ THRESHOLDS = np.round(np.arange(0.05, 0.96, 0.01), 2)
 MISSED_GRID = (0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
 BUNDLE_FILE = "bundle.json"
 PACKAGES = ("numpy", "polars", "scipy", "scikit-learn", "lightgbm", "rapidfuzz", "anyascii")
-NON_FEATURES = {"i", "j", "y", "jsrc", "prob"}
+NON_FEATURES = {"i", "j", "y", "jsrc"}
 
 
 # ---------------------------------------------------------------- stages
@@ -184,27 +184,35 @@ def choose_rule(codes, n_true, prob, y) -> tuple[float, dict, list]:
 # ---------------------------------------------------------------- bundle
 
 @dataclass
-class Bundle:
-    config: Config
+class Stage:
+    """One matcher: the fold models of a cross-validation and their feature names."""
     features: list[str]
-    rule: dict
     boosters: list[lgb.Booster]
-    report: dict
-    oof: pl.DataFrame | None = None  # out-of-fold predictions, saved for error analysis
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Mean probability of the fold models."""
         return np.mean([b.predict(X, num_iteration=b.best_iteration) for b in self.boosters], axis=0)
 
+
+@dataclass
+class Bundle:
+    config: Config
+    stages: list[Stage]
+    rule: dict
+    report: dict
+    oof: pl.DataFrame | None = None  # out-of-fold predictions, saved for error analysis
+
     def save(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
-        files = []
-        for n, b in enumerate(self.boosters):
-            name = f"fold_{n}.txt"
-            b.save_model(directory / name, num_iteration=b.best_iteration)
-            files.append(name)
-        meta = {"config": self.config.to_dict(), "features": self.features,
-                "rule": self.rule, "models": files, "report": self.report}
+        stages = []
+        for s, stage in enumerate(self.stages, 1):
+            files = []
+            for n, b in enumerate(stage.boosters):
+                name = f"stage{s}_fold{n}.txt"
+                b.save_model(directory / name, num_iteration=b.best_iteration)
+                files.append(name)
+            stages.append({"features": stage.features, "models": files})
+        meta = {"config": self.config.to_dict(), "stages": stages, "rule": self.rule, "report": self.report}
         (directory / BUNDLE_FILE).write_text(json.dumps(meta, indent=2))
         if self.oof is not None:
             self.oof.write_parquet(directory / "oof.parquet")
@@ -216,12 +224,31 @@ class Bundle:
         if not path.is_file():
             raise data.DataError(f"no model bundle at {directory}; run `train` first")
         meta = json.loads(path.read_text())
-        boosters = [lgb.Booster(model_file=str(directory / f)) for f in meta["models"]]
-        for b in boosters:
-            if b.num_feature() != len(meta["features"]):
+        stages = []
+        for st in meta["stages"]:
+            boosters = [lgb.Booster(model_file=str(directory / f)) for f in st["models"]]
+            if any(b.num_feature() != len(st["features"]) for b in boosters):
                 raise data.DataError(f"{directory}: model features do not match the bundle")
-        return cls(Config.from_dict(meta["config"]), meta["features"], meta["rule"],
-                   boosters, meta["report"])
+            stages.append(Stage(st["features"], boosters))
+        return cls(Config.from_dict(meta["config"]), stages, meta["rule"], meta["report"])
+
+
+def score_pairs(recs: pl.DataFrame, pairs: pl.DataFrame, stage: Stage, size: int) -> np.ndarray:
+    """Probabilities of one stage for every pair; features are built chunk by
+    chunk and discarded, so memory stays flat whatever the number of pairs."""
+    out = np.empty(pairs.height, dtype=np.float32)
+    for s, f in zip(range(0, pairs.height, size), feature_chunks(recs, pairs, size)):
+        out[s:s + f.height] = stage.predict(matrix(f, stage.features))
+    return out
+
+
+def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size: int) -> np.ndarray:
+    """Final probabilities: stage 1, then (if present) stage 2 on stage-1 context."""
+    prob = score_pairs(recs, pairs, stages[0], size)
+    if len(stages) > 1:
+        ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", prob)))
+        prob = score_pairs(recs, pl.concat([pairs, ctx.drop("i", "j")], how="horizontal"), stages[1], size)
+    return prob
 
 
 def _sha256(path: Path) -> str:
@@ -268,8 +295,8 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     sample = n_true_all.sample(min(cfg.train_s1_sample, n_true_all.height), seed=cfg.seed).sort("row")
     code_of = np.full(recs.height, -1, dtype=np.int64)
     code_of[sample["row"].to_numpy()] = np.arange(sample.height)
-    sp = pairs.filter(pl.col("i").is_in(sample["row"].implode()))
-    table = build_features(recs, sp, cfg.feature_chunk)
+    in_sample = pairs["i"].is_in(sample["row"].implode()).to_numpy()
+    table = build_features(recs, pairs.filter(pl.Series(in_sample)), cfg.feature_chunk)
     names = [c for c in table.columns if c not in NON_FEATURES]
     X, y = matrix(table, names), table["y"].to_numpy()
     codes = code_of[table["i"].to_numpy()]
@@ -278,10 +305,33 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
              sample.height, len(y), len(names), int(y.sum()))
 
     oof, boosters = cross_validate(X, y, codes, cfg)
+    stages = [Stage(names, boosters)]
+    stage1_score = choose_rule(codes, n_true, oof, y)[0]
+    log.info("stage 1 out-of-fold macro F0.5 %.4f", stage1_score)
+    country = sample["country_key"].to_numpy()
+    if country_check:  # on stage-1 features, whose inputs never saw the held-out country
+        transfer = _country_transfer(X, y, codes, n_true, country, cfg,
+                                     max(1, int(np.mean([b.best_iteration for b in boosters]))))
+
+    if cfg.stages > 1:
+        # Stage-1 probabilities for every training pair: out-of-fold for the sample,
+        # fold-model average for pairs of Source 1 records outside the sample.
+        t0 = time.time()
+        p1 = np.empty(pairs.height, dtype=np.float32)
+        p1[in_sample] = oof
+        p1[~in_sample] = score_pairs(recs, pairs.filter(pl.Series(~in_sample)), stages[0], cfg.feature_chunk)
+        ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", p1)))
+        ctx = ctx.filter(pl.Series(in_sample)).drop("i", "j")
+        log.info("stage-1 context for %d pairs in %.0fs (peak %.1f GB)", pairs.height, time.time() - t0, peak_gb())
+        del X
+        table = pl.concat([table, ctx], how="horizontal")
+        names = names + ctx.columns
+        X = matrix(table, names)
+        oof, boosters = cross_validate(X, y, codes, cfg)
+        stages.append(Stage(names, boosters))
+
     score, rule, trials = choose_rule(codes, n_true, oof, y)
     log.info("out-of-fold macro F0.5 %.4f with rule %s; best trials %s", score, rule, trials)
-
-    country = sample["country_key"].to_numpy()
     keep = apply_rule(rule, codes, oof)
     by_country = {}
     for c in np.unique(country):
@@ -297,16 +347,16 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "blocking": blocking,
         "sample_s1": sample.height, "sample_pairs": len(y), "sample_positives": int(y.sum()),
+        "stage1_oof_f05": round(stage1_score, 5),
         "oof_f05": round(score, 5), "rule": rule, "rule_trials": trials, "oof_f05_by_country": by_country,
-        "fold_rounds": [b.best_iteration for b in boosters],
+        "fold_rounds": [[b.best_iteration for b in st.boosters] for st in stages],
         "feature_gain": dict(sorted(zip(names, gain.round(1).tolist()), key=lambda kv: -kv[1])),
         "provenance": prov,
     }
     if country_check:
-        report["unseen_country"] = _country_transfer(X, y, codes, n_true, country, cfg,
-                                                     max(1, int(np.mean(report["fold_rounds"]))), rule)
+        report["unseen_country_stage1"] = transfer
     report["train_seconds"] = round(time.time() - t_start, 1)
-    bundle = Bundle(cfg, names, rule, boosters, report)
+    bundle = Bundle(cfg, stages, rule, report)
     bundle.oof = table.select("i", "j", "y").with_columns(
         pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes))
     return bundle
@@ -328,16 +378,24 @@ def _blocking_report(pairs: pl.DataFrame, n_true: pl.DataFrame) -> dict:
     return out
 
 
-def _country_transfer(X, y, codes, n_true, country, cfg, rounds, rule) -> dict:
+def _country_transfer(X, y, codes, n_true, country, cfg, rounds) -> dict:
     """Leave-one-country-out on the training sample: train on the other countries,
-    score the held-out one. Estimates quality on a country never seen in training
-    (the test set adds France)."""
+    score the held-out one with the rule chosen on the training countries' own
+    out-of-fold predictions. Estimates quality on a country never seen in
+    training (the test set adds France)."""
     pair_country = country[codes]
     out = {}
     for c in np.unique(country):
         held = pair_country == c
         if held.all():
             continue
+        # Rule chosen without the held-out country: out-of-fold on the others.
+        tr_ent = np.flatnonzero(country != c)
+        tr_remap = np.full(len(country), -1)
+        tr_remap[tr_ent] = np.arange(len(tr_ent))
+        tr_codes = tr_remap[codes[~held]]
+        inner = cross_validate(X[~held], y[~held], tr_codes, cfg)[0]
+        rule = choose_rule(tr_codes, n_true[tr_ent], inner, y[~held])[1]
         b = fit(X[~held], y[~held], cfg, rounds=rounds)
         prob = b.predict(X[held])
         ent = np.flatnonzero(country == c)
@@ -345,7 +403,8 @@ def _country_transfer(X, y, codes, n_true, country, cfg, rounds, rule) -> dict:
         remap[ent] = np.arange(len(ent))
         cc, nt = remap[codes[held]], n_true[ent]
         best = choose_rule(cc, nt, prob, y[held])
-        out[str(c)] = {"f05_with_chosen_rule": round(macro_f05(cc, nt, apply_rule(rule, cc, prob), y[held]), 5),
+        out[str(c)] = {"f05_with_rule_from_other_country": round(macro_f05(cc, nt, apply_rule(rule, cc, prob), y[held]), 5),
+                       "rule_from_other_country": rule,
                        "f05_best_rule": round(best[0], 5), "best_rule": best[1]}
         log.info("unseen-country check, held out %s: %s", c, out[str(c)])
     return out
@@ -360,10 +419,9 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None
     recs, pairs = candidate_table(raw, bundle.config, prov["inputs"], cache)
     del raw
     t0 = time.time()
-    prob = np.concatenate([bundle.predict(matrix(f, bundle.features))
-                           for f in feature_chunks(recs, pairs, bundle.config.feature_chunk)]) \
-        if pairs.height else np.zeros(0)
-    log.info("scored %d pairs in %.1fs", pairs.height, time.time() - t0)
+    prob = score_all(recs, pairs, bundle.stages, bundle.config.feature_chunk) if pairs.height else np.zeros(0)
+    log.info("scored %d pairs with %d stage(s) in %.1fs (peak %.1f GB)", pairs.height, len(bundle.stages),
+             time.time() - t0, peak_gb())
     if bundle.config.exclusive:
         prob = np.where(owner_mask(pairs, prob), prob, 0.0)
     keep = apply_rule(bundle.rule, pairs["i"].to_numpy(), prob) & (prob > 0)

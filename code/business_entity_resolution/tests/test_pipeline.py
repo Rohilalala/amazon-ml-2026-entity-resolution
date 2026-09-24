@@ -71,9 +71,10 @@ def test_model_quality_and_unseen_country(trained):
     report = pipeline.Bundle.load(model_dir).report
     assert report["blocking"]["pair_recall"] > 0.95
     assert report["oof_f05"] > 0.9
-    assert set(report["unseen_country"]) == {"us", "india"}
-    for v in report["unseen_country"].values():
-        assert v["f05_with_chosen_rule"] > 0.85
+    assert report["oof_f05"] >= report["stage1_oof_f05"] - 0.01
+    assert set(report["unseen_country_stage1"]) == {"us", "india"}
+    for v in report["unseen_country_stage1"].values():
+        assert v["f05_with_rule_from_other_country"] > 0.85
     assert (model_dir / "predict_report.json").is_file()
 
 
@@ -98,7 +99,8 @@ def test_bundle_round_trip_keeps_config(trained):
     bundle = pipeline.Bundle.load(model_dir)
     assert bundle.config.folds == 3
     assert bundle.rule["kind"] in {"threshold", "expected_f05"}
-    assert len(bundle.boosters) == 3
+    assert [len(st.boosters) for st in bundle.stages] == [3, 3]
+    assert set(bundle.stages[0].features) < set(bundle.stages[1].features)
 
 
 def test_bad_prefix_is_rejected(dataset, tmp_path):

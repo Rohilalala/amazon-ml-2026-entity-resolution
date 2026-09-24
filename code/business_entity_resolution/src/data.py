@@ -128,6 +128,7 @@ def write_id_lists(path: Path, column: str, frame: pl.DataFrame) -> None:
     try:
         (frame.select(pl.col("s1").alias("source1_entity_id"), pl.col("id").alias(column))
          .write_csv(tmp, separator="\t", quote_style="never"))
+        os.chmod(tmp, 0o644)  # mkstemp creates 0600; outputs are meant to be shared
         os.replace(tmp, path)
     except BaseException:
         os.unlink(tmp)

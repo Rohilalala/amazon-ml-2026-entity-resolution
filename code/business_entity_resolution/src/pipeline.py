@@ -153,13 +153,7 @@ def macro_f05(codes, n_true, keep, y) -> float:
     return float(f05_counts(n_pred, n_true, tp).mean())
 
 
-def owner_mask(pairs: pl.DataFrame, prob: np.ndarray) -> np.ndarray:
-    """True where the pair is the most likely owner of its Source 2/3 record."""
-    top = pl.DataFrame({"j": pairs["j"], "p": prob}).select(pl.col("p").max().over("j"))["p"].to_numpy()
-    return prob >= top
-
-
-def expected_f05_mask(group: np.ndarray, prob: np.ndarray, missed: float) -> np.ndarray:
+def expected_f05_mask(group: np.ndarray, prob: np.ndarray, missed: float, none_scale: float = 1.0) -> np.ndarray:
     """Per Source 1 record, keep the top-k candidates that maximise expected F0.5.
 
     With candidates sorted by probability p1 >= p2 >= ..., keeping the top k scores
@@ -167,13 +161,14 @@ def expected_f05_mask(group: np.ndarray, prob: np.ndarray, missed: float) -> np.
     is the expected number of true matches blocking did not retrieve. Keeping
     nothing scores 1 only for a singleton: E[F] ~ prod(1 - p) when `missed` is 0,
     shrunk by exp(-missed). The best k (possibly 0) is chosen per record.
+    `none_scale` > 1 favours "keep nothing" (used for countries unseen in training).
     """
     df = pl.DataFrame({"g": group, "p": prob, "idx": np.arange(len(prob))}).sort(["g", "p"], descending=[False, True])
     df = df.with_columns(
         k=pl.int_range(1, pl.len() + 1).over("g"),
         cum=pl.col("p").cum_sum().over("g"),
         total=pl.col("p").sum().over("g"),
-        none=((1 - pl.col("p")).clip(1e-12).log().sum().over("g").exp() * np.exp(-missed)),
+        none=((1 - pl.col("p")).clip(1e-12).log().sum().over("g").exp() * np.exp(-missed) * none_scale),
     ).with_columns(ef=1.25 * pl.col("cum") / (0.25 * (pl.col("total") + missed) + pl.col("k")))
     df = df.with_columns(best=pl.col("ef").max().over("g"))
     best_k = pl.when(pl.col("best") > pl.col("none")).then(
@@ -202,6 +197,57 @@ def choose_rule(codes, n_true, prob, y) -> tuple[float, dict, list]:
     best = max(trials, key=lambda t: t[0])
     top = sorted(trials, key=lambda t: -t[0])[:5]
     return best[0], best[1], [{"f05": round(f, 5), **r} for f, r in top]
+
+
+def _empty_share(group: np.ndarray, keep: np.ndarray, n_s1: int) -> float:
+    """Share of `n_s1` Source 1 records (including those without candidates) left empty."""
+    return 1.0 - len(np.unique(group[keep])) / max(1, n_s1)
+
+
+def decide(i: np.ndarray, j: np.ndarray, prob: np.ndarray, pair_country: np.ndarray, s1_country: np.ndarray,
+           bundle: "Bundle") -> tuple[np.ndarray, dict]:
+    """Final keep mask. Each Source 2/3 record goes to its most likely Source 1 record
+    (exclusive owner rule), then the decision rule. For a country absent from training
+    (France), the expected-F0.5 rule's "keep nothing" weight is raised until its share
+    of empty Source 1 records matches the seen countries in the same run: an unseen
+    country's probabilities are over-confident, and this uses no labels."""
+    cfg, rule = bundle.config, bundle.rule
+    if cfg.exclusive:
+        top = pl.DataFrame({"j": j, "p": prob}).select(pl.col("p").max().over("j"))["p"].to_numpy()
+        prob = np.where(prob >= top, prob, 0.0)
+    keep = apply_rule(rule, i, prob) & (prob > 0)
+    info = {}
+    seen = set(bundle.report.get("oof_f05_by_country", {}))
+    countries, n_s1 = np.unique(s1_country, return_counts=True)
+    unseen = [c for c in countries if c not in seen]
+    if rule["kind"] != "expected_f05" or not unseen or cfg.unseen_none_cap <= 1 or not seen:
+        return keep, info
+    share = {c: _empty_share(i[pair_country == c], keep[pair_country == c], n) for c, n in zip(countries, n_s1)}
+    target = min(share[c] for c in countries if c in seen)
+    for c, n in zip(countries, n_s1):
+        if c in seen:
+            continue
+        m = pair_country == c
+        gi, pc = i[m], prob[m]
+
+        def mask(scale):
+            return expected_f05_mask(gi, pc, rule["missed"], scale) & (pc > 0)
+        lo, hi = 1.0, float(cfg.unseen_none_cap)
+        if share[c] >= target:
+            scale = 1.0
+        elif _empty_share(gi, mask(hi), n) <= target:
+            scale = hi
+        else:
+            for _ in range(25):  # bisection on the empty share, which grows with the scale
+                mid = (lo + hi) / 2
+                lo, hi = (mid, hi) if _empty_share(gi, mask(mid), n) < target else (lo, mid)
+            scale = hi
+        keep[m] = mask(scale)
+        info[str(c)] = {"none_scale": round(scale, 4), "empty_share_before": round(share[c], 5),
+                        "empty_share_after": round(_empty_share(gi, keep[m], n), 5), "target": round(target, 5)}
+        log.info("unseen country %s: none_scale %.3f, empty share %.4f -> %.4f (seen countries %.4f)",
+                 c, scale, share[c], info[str(c)]["empty_share_after"], target)
+    return keep, info
 
 
 # ---------------------------------------------------------------- bundle
@@ -549,7 +595,7 @@ def _country_transfer(X, y, codes, n_true, country, cfg, rounds) -> dict:
     return out
 
 
-def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None
+def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_dir: Path | None = None
             ) -> tuple[pl.Series, pl.DataFrame, pl.DataFrame, dict]:
     """Matches and candidates for every test Source 1 record, checked against the
     submission rules. Returns (ids, match lists, candidate lists, report)."""
@@ -565,13 +611,33 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None
         if pairs.height else np.zeros(0)
     log.info("scored %d pairs with %d stage(s) in %.1fs (peak %.1f GB)", pairs.height, len(bundle.stages),
              time.time() - t0, peak_gb())
-    if bundle.config.exclusive:
-        prob = np.where(owner_mask(pairs, prob), prob, 0.0)
-    keep = apply_rule(bundle.rule, pairs["i"].to_numpy(), prob) & (prob > 0)
-    matched = pairs.select("i", "j").filter(pl.Series(keep))
+    scores_dir = bundle_dir / "test_scores" if bundle_dir else None
+    if scores_dir:
+        scores_dir.mkdir(parents=True, exist_ok=True)
+        pairs.select("i", "j").with_columns(pl.Series("prob", prob.astype(np.float32))).write_parquet(
+            scores_dir / "pairs.parquet")
+        recs.select("row", "entity_id", "src", "country_key").write_parquet(scores_dir / "records.parquet")
+    return finish(recs.select("row", "entity_id", "src", "country_key"), pairs.select("i", "j"), prob, bundle, prov)
 
-    id_of = recs["entity_id"].to_numpy()
-    s1 = recs.filter(pl.col("src") == 1)
+
+def load_scores(bundle_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame, np.ndarray]:
+    """Records, candidate pairs and final probabilities saved by the last predict()."""
+    d = bundle_dir / "test_scores"
+    if not (d / "pairs.parquet").is_file():
+        raise data.DataError(f"no saved test scores in {d}; run `predict` first")
+    scored = pl.read_parquet(d / "pairs.parquet")
+    return pl.read_parquet(d / "records.parquet"), scored.select("i", "j"), scored["prob"].to_numpy()
+
+
+def finish(records: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, bundle: Bundle, prov: dict | None = None
+           ) -> tuple[pl.Series, pl.DataFrame, pl.DataFrame, dict]:
+    """Decision rule, id lists and submission checks from scored pairs."""
+    country = records["country_key"].to_numpy()
+    i, j = pairs["i"].to_numpy(), pairs["j"].to_numpy()
+    s1 = records.filter(pl.col("src") == 1)
+    keep, calibration = decide(i, j, prob, country[i], s1["country_key"].to_numpy(), bundle)
+    matched = pairs.filter(pl.Series(keep))
+    id_of = records["entity_id"].to_numpy()
     ids = s1["entity_id"]
     match_lists = data.id_lists(ids, matched, id_of)
     cand_lists = data.id_lists(ids, pairs.select("i", "j"), id_of)
@@ -585,5 +651,5 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None
         log.info("test %s: %s", c, v)
     report = {"predicted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "test_s1": len(ids),
               "test_pairs": pairs.height, "matched_pairs": matched.height, "by_country": by_country,
-              "provenance": prov}
+              "unseen_country_calibration": calibration, "provenance": prov}
     return ids, match_lists, cand_lists, report

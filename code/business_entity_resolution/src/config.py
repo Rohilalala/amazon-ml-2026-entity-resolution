@@ -49,6 +49,9 @@ class Config:
     # Decision: each Source 2/3 record goes to its most likely Source 1 record
     # only (the training ground truth never assigns one record to two).
     exclusive: bool = True
+    # Countries without training labels (France): "keep nothing" may be up-weighted
+    # by at most this factor to match the seen countries' empty-prediction share.
+    unseen_none_cap: float = 4.0
     lgb_params: dict = field(default_factory=_default_lgb_params)
     stage3_lgb_params: dict = field(default_factory=lambda: {"learning_rate": 0.05, "num_leaves": 63})
 

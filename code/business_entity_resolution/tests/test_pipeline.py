@@ -175,3 +175,33 @@ def test_cached_run_matches_uncached(dataset, trained, tmp_path):
         for name in ("matching_results.tsv", "candidate_pairs.tsv"):
             assert (dest / name).read_bytes() == (out / name).read_bytes()
     assert len(list(cache.iterdir())) == 1
+
+
+def test_decide_from_saved_scores_matches_predict(dataset, trained, tmp_path):
+    model_dir, out = trained
+    assert (model_dir / "test_scores" / "pairs.parquet").is_file()
+    assert cli.main(["decide", "--model", str(model_dir), "--out", str(tmp_path)]) == 0
+    for name in ("matching_results.tsv", "candidate_pairs.tsv"):
+        assert (tmp_path / name).read_bytes() == (out / name).read_bytes()
+
+
+def test_unseen_country_calibration_only_touches_unseen_countries(trained, tmp_path):
+    import json
+    model_dir, out = trained
+    report = json.loads((model_dir / "predict_report.json").read_text())
+    assert set(report["unseen_country_calibration"]) <= {"france"}
+    off = tmp_path / "off"
+    assert cli.main(["decide", "--model", str(model_dir), "--out", str(off), "--unseen-none-cap", "1"]) == 0
+    a = _read(out / "matching_results.tsv")
+    b = _read(off / "matching_results.tsv")
+    # Rows for seen countries are identical with and without the calibration.
+    recs = pl.read_parquet(model_dir / "test_scores" / "records.parquet").filter(pl.col("src") == 1)
+    seen = recs.filter(pl.col("country_key") != "france")["entity_id"]
+    ja = a.filter(pl.col("source1_entity_id").is_in(seen.implode()))
+    jb = b.filter(pl.col("source1_entity_id").is_in(seen.implode()))
+    assert ja.equals(jb)
+    # With the calibration France never gains matches.
+    fr = recs.filter(pl.col("country_key") == "france")["entity_id"]
+    na = a.filter(pl.col("source1_entity_id").is_in(fr.implode()))["matched_entity_ids"].str.len_chars().sum()
+    nb = b.filter(pl.col("source1_entity_id").is_in(fr.implode()))["matched_entity_ids"].str.len_chars().sum()
+    assert na <= nb

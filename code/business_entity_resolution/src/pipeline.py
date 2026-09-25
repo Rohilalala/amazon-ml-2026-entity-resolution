@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 
@@ -23,7 +23,7 @@ import numpy as np
 import polars as pl
 from sklearn.model_selection import GroupKFold
 
-from . import alignment, candidates, data, features, groupfeat, indic, text
+from . import alignment, candidates, data, features, groupfeat, indic, locale_norm, text
 from .config import Config
 from .metric import f05_counts
 
@@ -37,6 +37,15 @@ PACKAGES = ("numpy", "polars", "scipy", "scikit-learn", "lightgbm", "rapidfuzz",
 NON_FEATURES = {"i", "j", "y", "jsrc"}
 # Stage 3 rescores only pairs whose stage-2 probability reaches this value.
 STAGE3_ACTIVE = 0.001
+# Stage-3 group features that let a candidate's siblings vouch for a deviation they
+# share with it (house number, name tokens). True copies share their corruption in
+# training, but decoy businesses in the test set come as copy groups that share
+# their difference too; the "robust" stage 3 is trained without these features.
+def robust_stage3_features(names: list[str]) -> list[str]:
+    return [n for n in names if "nov" not in n and "h_dev" not in n]
+
+
+STAGE3_CHOICES = ("full", "robust", "none")
 
 
 # ---------------------------------------------------------------- stages
@@ -65,13 +74,22 @@ def candidate_table(raw: pl.DataFrame, cfg: Config, inputs: dict,
     With `cache`, results are stored under a key derived from the input hashes,
     the blocking settings and the code, and reused when all of them match.
     """
+    # Locale rules (label-free, learned from this split's addresses) are part of what
+    # the candidate table depends on; they are empty for the US/India training data,
+    # so they only enter the cache key when they change something.
+    rules = locale_norm.learn(raw.select(
+        pl.col("country").str.strip_chars().str.to_lowercase().alias("country_key"), "src",
+        text.clean_address(raw["business_address"]).alias("addr")))
+    if rules:
+        log.info("locale rules: %s", rules)
+        inputs = {**inputs, "locale_rules": rules}
     where = cache / _cache_key(inputs, cfg) if cache else None
     if where and (where / "pairs.parquet").is_file():
         recs, pairs = pl.read_parquet(where / "recs.parquet"), pl.read_parquet(where / "pairs.parquet")
         log.info("loaded %d records and %d candidate pairs from cache %s", recs.height, pairs.height, where)
         return recs, pairs
     t0 = time.time()
-    recs = features.prepare(raw)
+    recs = locale_norm.apply(features.prepare(raw), rules)
     log.info("normalised %d records in %.1fs (peak %.1f GB)", recs.height, time.time() - t0, peak_gb())
     t0 = time.time()
     pairs = candidates.generate(recs, cfg.k, cfg.k_rev, cfg.max_df)
@@ -270,6 +288,7 @@ class Bundle:
     rule: dict
     report: dict
     native_words: dict | None = None  # Indic -> English dictionary learned in training
+    variants: dict = field(default_factory=dict)  # alternative stage-3 models, e.g. {"robust": Stage}
     oof: pl.DataFrame | None = None  # out-of-fold predictions, saved for error analysis
 
     def save(self, directory: Path) -> None:
@@ -282,7 +301,16 @@ class Bundle:
                 b.save_model(directory / name, num_iteration=b.best_iteration)
                 files.append(name)
             stages.append({"features": stage.features, "models": files})
-        meta = {"config": self.config.to_dict(), "stages": stages, "rule": self.rule, "report": self.report}
+        variants = {}
+        for name, stage in self.variants.items():
+            files = []
+            for n, b in enumerate(stage.boosters):
+                fname = f"stage3_{name}_fold{n}.txt"
+                b.save_model(directory / fname, num_iteration=b.best_iteration)
+                files.append(fname)
+            variants[name] = {"features": stage.features, "models": files}
+        meta = {"config": self.config.to_dict(), "stages": stages, "variants": variants,
+                "rule": self.rule, "report": self.report}
         (directory / BUNDLE_FILE).write_text(json.dumps(meta, indent=2))
         (directory / NATIVE_FILE).write_text(json.dumps(self.native_words or {}, ensure_ascii=False,
                                                         sort_keys=True), encoding="utf-8")
@@ -296,15 +324,15 @@ class Bundle:
         if not path.is_file():
             raise data.DataError(f"no model bundle at {directory}; run `train` first")
         meta = json.loads(path.read_text())
-        stages = []
-        for st in meta["stages"]:
+        def stage(st):
             boosters = [lgb.Booster(model_file=str(directory / f)) for f in st["models"]]
             if any(b.num_feature() != len(st["features"]) for b in boosters):
                 raise data.DataError(f"{directory}: model features do not match the bundle")
-            stages.append(Stage(st["features"], boosters))
+            return Stage(st["features"], boosters)
         native = directory / NATIVE_FILE
         words = json.loads(native.read_text(encoding="utf-8")) if native.is_file() else {}
-        return cls(Config.from_dict(meta["config"]), stages, meta["rule"], meta["report"], words)
+        return cls(Config.from_dict(meta["config"]), [stage(st) for st in meta["stages"]], meta["rule"],
+                   meta["report"], words, {k: stage(v) for k, v in meta.get("variants", {}).items()})
 
 
 def score_pairs(recs: pl.DataFrame, pairs: pl.DataFrame, stage: Stage, size: int, tables: dict,
@@ -337,9 +365,11 @@ def stage3_scores(recs: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, sta
     return out
 
 
-def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size: int, tables: dict) -> np.ndarray:
-    """Final probabilities through every stage. Stage-1 features are kept in a
-    disk-backed array so stage 2 appends its context instead of recomputing them."""
+def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size: int, tables: dict,
+              variants: dict | None = None) -> dict:
+    """Probabilities through every stage: {"stage2": ..., "full": ..., <variant>: ...}
+    ("full" is the last stage). Stage-1 features are kept in a disk-backed array so
+    stage 2 appends its context instead of recomputing them."""
     n, first = pairs.height, stages[0]
     with tempfile.TemporaryDirectory(prefix="ber-features-") as tmp:
         store = np.lib.format.open_memmap(Path(tmp) / "stage1.npy", mode="w+", dtype=np.float32,
@@ -354,9 +384,12 @@ def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size
             for s in range(0, n, size):
                 prob[s:s + size] = second.predict(np.hstack([store[s:s + size], extra[s:s + size]]))
             del store
+    out = {"stage2": prob, "full": prob}
     if len(stages) > 2:
-        prob = stage3_scores(recs, pairs, prob, stages[2])
-    return prob
+        out["full"] = stage3_scores(recs, pairs, prob, stages[2])
+        for name, stage in (variants or {}).items():
+            out[name] = stage3_scores(recs, pairs, prob, stage)
+    return out
 
 
 def _dict_hash(d: dict) -> str:
@@ -451,6 +484,8 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
                                      max(1, int(np.mean([b.best_iteration for b in boosters]))))
 
     full_ctx = None
+    variants = {}
+    oof_stage2 = oof_robust = None
     if cfg.stages > 1:
         # Stage-1 probabilities for every training pair: out-of-fold for the sample,
         # fold-model average for pairs of Source 1 records outside the sample.
@@ -467,6 +502,7 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         oof, boosters = cross_validate(X, y, folds, cfg, stage=2)
         stages.append(Stage(names, boosters))
         stage_scores.append(choose_rule(codes, n_true, oof, y)[0])
+        oof_stage2 = oof
         log.info("stage 2 out-of-fold macro F0.5 %.4f", stage_scores[-1])
     del X
 
@@ -481,6 +517,13 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         stages.append(Stage(names3, boosters3))
         stage_scores.append(choose_rule(codes, n_true, oof, y)[0])
         log.info("stage 3 out-of-fold macro F0.5 %.4f (%d active pairs)", stage_scores[-1], int(act.sum()))
+        names3r = robust_stage3_features(names3)
+        oof3r, boosters3r = cross_validate(matrix(f3, names3r), y[act], folds[act], cfg, stage=3)
+        variants["robust"] = Stage(names3r, boosters3r)
+        oof_robust = oof.copy()
+        oof_robust[act] = oof3r
+        log.info("stage 3 robust (without %d shared-deviation features) out-of-fold macro F0.5 %.4f",
+                 len(names3) - len(names3r), choose_rule(codes, n_true, oof_robust, y)[0])
 
     score, rule, trials = choose_rule(codes, n_true, oof, y)
     log.info("out-of-fold macro F0.5 %.4f with rule %s; best trials %s", score, rule, trials)
@@ -493,10 +536,13 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
                                                  how="horizontal"), stages[1], cfg.feature_chunk, tables)
         else:
             h_prob = score_pairs(recs, hp, stages[0], cfg.feature_chunk, tables)
+        h_options = {"none": h_prob}
         if len(stages) > 2:
-            h_prob = stage3_scores(recs, hp, h_prob, stages[2])
-        holdout_report = _holdout_report(hp, h_prob, holdout, rule)
-        log.info("HOLDOUT (never trained on, scored like the test set): %s", holdout_report)
+            h_options["full"] = stage3_scores(recs, hp, h_prob, stages[2])
+            for name, st in variants.items():
+                h_options[name] = stage3_scores(recs, hp, h_prob, st)
+        holdout_report = {k: _holdout_report(hp, v, holdout, rule) for k, v in h_options.items()}
+        log.info("HOLDOUT (never trained on, scored like the test set) by stage-3 choice: %s", holdout_report)
     keep = apply_rule(rule, codes, oof)
     by_country = {}
     for c in np.unique(country):
@@ -523,8 +569,12 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         report["unseen_country_stage1"] = transfer
     report["holdout"] = holdout_report
     report["train_seconds"] = round(time.time() - t_start, 1)
-    bundle = Bundle(cfg, stages, rule, report, native)
-    bundle.oof = ids.with_columns(pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes))
+    if oof_robust is not None:
+        report["oof_f05_stage3_robust"] = round(choose_rule(codes, n_true, oof_robust, y)[0], 5)
+    bundle = Bundle(cfg, stages, rule, report, native, variants)
+    extra = [pl.Series(n, v.astype(np.float32)) for n, v in (("oof_stage2", oof_stage2), ("oof_robust", oof_robust))
+             if v is not None]
+    bundle.oof = ids.with_columns(pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes), *extra)
     return bundle
 
 
@@ -607,26 +657,38 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_di
     del raw
     t0 = time.time()
     tables = alignment.pool_tables(recs)
-    prob = score_all(recs, pairs, bundle.stages, bundle.config.feature_chunk, tables) \
-        if pairs.height else np.zeros(0)
+    probs = score_all(recs, pairs, bundle.stages, bundle.config.feature_chunk, tables, bundle.variants) \
+        if pairs.height else {"stage2": np.zeros(0), "full": np.zeros(0)}
     log.info("scored %d pairs with %d stage(s) in %.1fs (peak %.1f GB)", pairs.height, len(bundle.stages),
              time.time() - t0, peak_gb())
     scores_dir = bundle_dir / "test_scores" if bundle_dir else None
     if scores_dir:
         scores_dir.mkdir(parents=True, exist_ok=True)
-        pairs.select("i", "j").with_columns(pl.Series("prob", prob.astype(np.float32))).write_parquet(
+        pairs.select("i", "j").with_columns(
+            [pl.Series(f"prob_{k}", v.astype(np.float32)) for k, v in probs.items()]).write_parquet(
             scores_dir / "pairs.parquet")
         recs.select("row", "entity_id", "src", "country_key").write_parquet(scores_dir / "records.parquet")
-    return finish(recs.select("row", "entity_id", "src", "country_key"), pairs.select("i", "j"), prob, bundle, prov)
+    return finish(recs.select("row", "entity_id", "src", "country_key"), pairs.select("i", "j"),
+                  select_probability(probs, bundle), bundle, prov)
 
 
-def load_scores(bundle_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame, np.ndarray]:
-    """Records, candidate pairs and final probabilities saved by the last predict()."""
+def select_probability(probs: dict, bundle: Bundle) -> np.ndarray:
+    """The probability column the bundle's configuration uses for the decision."""
+    choice = bundle.config.stage3_use
+    key = "stage2" if choice == "none" else choice
+    if key not in probs:
+        raise data.DataError(f"stage-3 choice {choice!r} not available; have {sorted(probs)}")
+    return probs[key]
+
+
+def load_scores(bundle_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
+    """Records, candidate pairs and every saved probability column from the last predict()."""
     d = bundle_dir / "test_scores"
     if not (d / "pairs.parquet").is_file():
         raise data.DataError(f"no saved test scores in {d}; run `predict` first")
     scored = pl.read_parquet(d / "pairs.parquet")
-    return pl.read_parquet(d / "records.parquet"), scored.select("i", "j"), scored["prob"].to_numpy()
+    probs = {c.removeprefix("prob_"): scored[c].to_numpy() for c in scored.columns if c.startswith("prob_")}
+    return pl.read_parquet(d / "records.parquet"), scored.select("i", "j"), probs
 
 
 def finish(records: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, bundle: Bundle, prov: dict | None = None

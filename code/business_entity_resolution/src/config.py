@@ -52,6 +52,9 @@ class Config:
     # Countries without training labels (France): "keep nothing" may be up-weighted
     # by at most this factor to match the seen countries' empty-prediction share.
     unseen_none_cap: float = 4.0
+    # Which probabilities decide: "full" (stage 3), "robust" (stage 3 without the
+    # shared-deviation group features) or "none" (stage 2).
+    stage3_use: str = "full"
     lgb_params: dict = field(default_factory=_default_lgb_params)
     stage3_lgb_params: dict = field(default_factory=lambda: {"learning_rate": 0.05, "num_leaves": 63})
 

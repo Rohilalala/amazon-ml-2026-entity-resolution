@@ -45,8 +45,11 @@ def _decide(args) -> None:
     bundle = pipeline.Bundle.load(args.model)
     if args.unseen_none_cap is not None:
         bundle.config = dataclasses.replace(bundle.config, unseen_none_cap=args.unseen_none_cap)
-    records, pairs, prob = pipeline.load_scores(args.model)
-    _, matches, cands, report = pipeline.finish(records, pairs, prob, bundle)
+    if args.stage3 is not None:
+        bundle.config = dataclasses.replace(bundle.config, stage3_use=args.stage3)
+    records, pairs, probs = pipeline.load_scores(args.model)
+    _, matches, cands, report = pipeline.finish(records, pairs, pipeline.select_probability(probs, bundle), bundle)
+    report["stage3_use"] = bundle.config.stage3_use
     _write(args, matches, cands, report)
 
 
@@ -72,6 +75,8 @@ def main(argv=None) -> int:
         if name == "decide":
             p.add_argument("--unseen-none-cap", type=float, default=None,
                            help="override the unseen-country calibration cap (1 disables it)")
+            p.add_argument("--stage3", choices=pipeline.STAGE3_CHOICES, default=None,
+                           help="which probabilities decide: full, robust or none (stage 2)")
         if name != "predict":
             d = Config()
             p.add_argument("--k", type=int, default=d.k, help="candidates per Source 1 record and source")

@@ -73,7 +73,9 @@ def test_model_quality_and_unseen_country(trained):
     assert report["oof_f05"] > 0.9
     assert len(report["oof_f05_by_stage"]) == 3
     assert report["oof_f05"] >= report["oof_f05_by_stage"][0] - 0.01
-    assert report["holdout"]["f05"] > 0.85
+    assert set(report["holdout"]) == {"none", "full", "robust"}
+    assert all(v["f05"] > 0.85 for v in report["holdout"].values())
+    assert "oof_f05_stage3_robust" in report
     assert set(report["unseen_country_stage1"]) == {"us", "india"}
     for v in report["unseen_country_stage1"].values():
         assert v["f05_with_rule_from_other_country"] > 0.85
@@ -205,3 +207,16 @@ def test_unseen_country_calibration_only_touches_unseen_countries(trained, tmp_p
     na = a.filter(pl.col("source1_entity_id").is_in(fr.implode()))["matched_entity_ids"].str.len_chars().sum()
     nb = b.filter(pl.col("source1_entity_id").is_in(fr.implode()))["matched_entity_ids"].str.len_chars().sum()
     assert na <= nb
+
+
+def test_decide_can_switch_stage3_variant(trained, tmp_path):
+    model_dir, _ = trained
+    bundle = pipeline.Bundle.load(model_dir)
+    assert set(bundle.variants) == {"robust"}
+    assert not any("nov" in f or "h_dev" in f for f in bundle.variants["robust"].features)
+    _, _, probs = pipeline.load_scores(model_dir)
+    assert set(probs) == {"stage2", "full", "robust"}
+    for choice in ("robust", "none"):
+        assert cli.main(["decide", "--model", str(model_dir), "--out", str(tmp_path / choice),
+                         "--stage3", choice]) == 0
+        assert (tmp_path / choice / "matching_results.tsv").is_file()

@@ -158,17 +158,20 @@ def generate(recs: pl.DataFrame, k: int, k_rev: int, max_df: int) -> pl.DataFram
             nq = q_rows.height
             q, t = m[:nq], m[nq:]
             del m
+            schema = {"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32}
             r, c, v = search(q, t, k)
             t_fwd = time.time()
-            parts.append(pl.DataFrame({"i": glob[r], "j": glob[nq + c], "score": v},
-                                      schema={"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32}))
+            block = [pl.DataFrame({"i": glob[r], "j": glob[nq + c], "score": v}, schema=schema)]
             if k_rev:
                 r, c, v = search(t, q, k_rev)
-                parts.append(pl.DataFrame({"i": glob[c], "j": glob[nq + r], "score": v},
-                                          schema={"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32}))
+                block.append(pl.DataFrame({"i": glob[c], "j": glob[nq + r], "score": v}, schema=schema))
+            del q, t
+            # Blocks never share a Source 2/3 record, so de-duplicating per block is
+            # exact and keeps the peak memory independent of the number of blocks.
+            parts.append(pl.concat(block).group_by("i", "j").agg(pl.col("score").max()))
             log.info("blocking %s / source %d: %d + %d records, %d keys in vocabulary; keys %.0fs, "
                      "matrix %.0fs, forward %.0fs, reverse %.0fs", country, s, nq, t_rows.height, q.shape[1],
                      t_keys - t0, t_matrix - t_keys, t_fwd - t_matrix, time.time() - t_fwd)
     if not parts:
         return pl.DataFrame(schema={"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32})
-    return pl.concat(parts).group_by("i", "j").agg(pl.col("score").max()).sort("i", "j")
+    return pl.concat(parts).sort("i", "j")

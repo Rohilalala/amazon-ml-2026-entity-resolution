@@ -30,7 +30,7 @@ class Config:
     # frequency above which a blocking key is too common to use.
     k: int = 10
     k_rev: int = 3
-    max_df: int = 1000
+    max_df: int = 3000
     # Training: Source 1 records sampled for the matcher (their candidates
     # come from the full pool), cross-validation folds, feature chunk size.
     train_s1_sample: int = 500_000

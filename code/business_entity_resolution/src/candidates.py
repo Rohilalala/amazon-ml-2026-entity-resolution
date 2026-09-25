@@ -9,6 +9,17 @@ by *keys* that are rare even when their parts are common:
     a:  address word skeleton              da: number x address word
     c:  whole core name without spaces     na: name token x address word
         (matches 'qualityaceculture.com')
+    n3, nn3, c3: n, nn, c under skeleton3, which also merges the sounds that
+        Indic-script transliteration confuses ('teknalji' / 'technology')
+    cp, cs: first / last 6 letters of the concatenated name skeleton
+        ('dentalcare' / 'dentlcaregroup' share a prefix)
+    ap: order-free pair of address words
+
+Keys are built on blocking-only normalised strings (`tnorm`: look-alike digits
+inside name words, leading zeros and glued number ranges in addresses). The
+address words used are the rarest ones of the record within its blocking frame,
+so a long address keeps its street and locality words instead of the first
+words it happens to start with.
 
 Keys are weighted by inverse document frequency; keys seen once (they cannot
 link anything) or more than `max_df` times (too common to block on) are
@@ -43,7 +54,35 @@ SEARCH_CHUNK = 2000
 # scipy releases the GIL inside sparse products, so chunks run in parallel threads.
 SEARCH_THREADS = min(8, os.cpu_count() or 1)
 # Hash seeds keep the key families apart (a name token never equals a number key).
-SEED = {"n": 11, "d": 12, "a": 13, "c": 14, "nn": 21, "dn": 22, "da": 23, "na": 24}
+SEED = {"n": 11, "d": 12, "a": 13, "c": 14, "nn": 21, "dn": 22, "da": 23, "na": 24,
+        "cp": 32, "cs": 33, "ap": 35, "n3": 41, "nn3": 42, "c3": 43}
+# Digits used as letters inside a name word ('pi1ates', 'jacks0n'); Source 1 names never mix them.
+LEET_FROM, LEET_TO = ["0", "1", "5", "8", "6"], ["o", "l", "s", "b", "g"]
+
+
+def skeleton3(e: pl.Expr) -> pl.Expr:
+    """skeleton() after merging sounds that Indic-script transliteration confuses: soft c -> s,
+    soft g -> j, b -> v, m -> n (anusvara), -tion -> sion, tu -> cu, final ng -> n, j -> s, d -> t."""
+    e = e.str.replace_all(r"c([eiy])", "s$1").str.replace_all(r"g([eiy])", "j$1")
+    e = e.str.replace_all("b", "v").str.replace_all("m", "n")
+    e = e.str.replace_all(r"ti([aou])", "si$1").str.replace_all("tu", "cu").str.replace_all(r"ng$", "n")
+    return skeleton(e.str.replace_all("j", "s").str.replace_all("d", "t"))
+
+
+def tnorm(df: pl.DataFrame) -> pl.DataFrame:
+    """Blocking-only normalisation of `core` and `addr`: name words mixing letters and digits get
+    look-alike letters (pi1ates -> pilates); address numbers lose leading zeros (0355 -> 355) and
+    an even-length >= 6 digit run is split in halves (clean() glues '515-517' into '515517')."""
+    e = pl.element()
+    mixed = e.str.contains(r"[a-z]") & e.str.contains(r"\d")
+    core = pl.col("core").str.split(" ").list.eval(
+        pl.when(mixed).then(e.str.replace_many(LEET_FROM, LEET_TO)).otherwise(e)).list.join(" ")
+    z = pl.when(e.str.contains(r"^0+\d*[1-9a-z]")).then(e.str.strip_chars_start("0")).otherwise(e)
+    n = e.str.len_chars()
+    split = pl.when(e.str.contains(r"^\d+$") & (n >= 6) & (n % 2 == 0)).then(
+        e.str.slice(0, n // 2) + " " + e.str.slice(n // 2)).otherwise(e)
+    addr = pl.col("addr").str.split(" ").list.eval(z).list.eval(split).list.join(" ")
+    return df.select("row", core.alias("core"), addr.alias("addr"))
 
 
 def _tokens(df: pl.DataFrame, col: str) -> pl.DataFrame:
@@ -58,38 +97,48 @@ def _first(df: pl.DataFrame, limit: int) -> pl.DataFrame:
             .filter(pl.col("i") < limit))
 
 
-def _address_words(df: pl.DataFrame) -> pl.DataFrame:
-    """(row, h): hashed skeletons of the non-numeric address words, in address order."""
-    words = _tokens(df, "addr").filter(~pl.col("t").str.contains(r"\d")).with_columns(skeleton(pl.col("t")).alias("k"))
+def _address_words(addr: pl.DataFrame, sk=skeleton) -> pl.DataFrame:
+    """(row, h) hashed skeletons of the address words (no digits, skeleton >= 2 letters), in order."""
+    words = addr.filter(~pl.col("t").str.contains(r"\d")).with_columns(sk(pl.col("t")).alias("k"))
     return words.filter(pl.col("k").str.len_chars() >= 2).select("row", pl.col("k").hash(SEED["a"]).alias("h"))
 
 
-def word_frequencies(df: pl.DataFrame) -> pl.DataFrame:
-    """(h, wdf): in how many records of the block each address word occurs."""
-    return _address_words(df).unique().group_by("h").agg(pl.len().alias("wdf"))
+def _keys_chunk(df: pl.DataFrame, word_df: pl.DataFrame | None = None, uv3: bool = False) -> pl.DataFrame:
+    """(row, h) blocking keys for one chunk of records (`row`, `core`, `addr`). `word_df`
+    (h, wdf) orders each record's address words rarest first before the first
+    MAX_ADDR_WORDS are kept; without it they keep their address order. `uv3`: only the
+    eight base families, every skeleton replaced by skeleton3 (the second channel)."""
+    df = tnorm(df)
+    sk = skeleton3 if uv3 else skeleton
+    toks = _tokens(df, "core")
 
+    def name_keys(sk, seed):
+        k = sk(pl.col("t"))
+        return _first(toks.select("row", pl.when(k == "").then(pl.col("t")).otherwise(k).hash(seed).alias("h")),
+                      MAX_NAME_TOKENS)
 
-def _keys_chunk(df: pl.DataFrame, word_df: pl.DataFrame | None = None) -> pl.DataFrame:
-    """(row, h) blocking keys for one chunk of records (`row`, `core`, `addr`).
-    With `word_df`, each record keys on its rarest address words rather than its
-    first ones (long Indian addresses put the distinctive words last)."""
-    name = _tokens(df, "core").with_columns(skeleton(pl.col("t")).alias("k"))
-    name = _first(name.select("row", pl.when(pl.col("k") == "").then(pl.col("t")).otherwise(pl.col("k"))
-                              .hash(SEED["n"]).alias("h")), MAX_NAME_TOKENS)
+    name, name3 = name_keys(sk, SEED["n"]), name_keys(skeleton3, SEED["n3"])
     addr = _tokens(df, "addr")
     nums = _first(addr.filter(pl.col("t").str.contains(r"\d"))
                   .select("row", pl.col("t").hash(SEED["d"]).alias("h")), MAX_NUMBERS)
-    words = _address_words(df)
+    words = _address_words(addr, sk)
     if word_df is not None:
+        # Order-preserving join, then a stable sort: ties keep address order, so the
+        # chosen words are the same on every run.
         words = (words.join(word_df, on="h", how="left", maintain_order="left")
                  .with_columns(pl.col("wdf").fill_null(0)).sort("row", "wdf", maintain_order=True).drop("wdf"))
     words = _first(words, MAX_ADDR_WORDS)
-    concat = df.select("row", skeleton(pl.col("core").str.replace_all(" ", "")).hash(SEED["c"]).alias("h"))
+    joined = pl.col("core").str.replace_all(" ", "")
+    concat = df.select("row", sk(joined).hash(SEED["c"]).alias("h"))
+    concat3 = df.select("row", skeleton3(joined).hash(SEED["c3"]).alias("h"))
+    cc = df.select("row", skeleton(joined).alias("s"))
+    cc = cc.with_columns(pl.when(pl.col("s").str.len_chars() > 6).then(pl.col("s").str.replace(r"km$", ""))
+                         .otherwise(pl.col("s")).alias("s")).filter(pl.col("s").str.len_chars() >= 7)
 
     def pairs(a, b, seed, ordered=True, a_limit=None):
         left = a if a_limit is None else a.filter(pl.col("i") < a_limit)
         j = left.join(b.select("row", pl.col("h").alias("h2"), pl.col("i").alias("i2")), on="row")
-        if not ordered:  # name-token pairs: each unordered pair once, order-free key
+        if not ordered:  # token pairs: each unordered pair once, order-free key
             j = j.filter(pl.col("i") < pl.col("i2")).with_columns(
                 pl.min_horizontal("h", "h2").alias("h"), pl.max_horizontal("h", "h2").alias("h2"))
         return j.select("row", pl.struct("h", "h2").hash(seed).alias("h"))
@@ -98,14 +147,22 @@ def _keys_chunk(df: pl.DataFrame, word_df: pl.DataFrame | None = None) -> pl.Dat
              pairs(name, name, SEED["nn"], ordered=False),
              pairs(nums, name, SEED["dn"]), pairs(nums, words, SEED["da"]),
              pairs(name, words, SEED["na"], a_limit=3)]
+    if not uv3:
+        parts += [name3.select("row", "h"), concat3, pairs(name3, name3, SEED["nn3"], ordered=False),
+                  cc.select("row", pl.col("s").str.slice(0, 6).hash(SEED["cp"]).alias("h")),
+                  cc.select("row", pl.col("s").str.slice(-6).hash(SEED["cs"]).alias("h")),
+                  pairs(words, words, SEED["ap"], ordered=False)]
     return pl.concat([p.with_columns(pl.col("row").cast(pl.UInt32)) for p in parts]).unique()
 
 
-def record_keys(recs: pl.DataFrame, rare_words: bool = True) -> pl.DataFrame:
-    """(row, h) blocking keys of every record; `recs` needs `row`, `core`, `addr`.
-    Address-word frequencies are counted over all of `recs` (one block)."""
-    word_df = word_frequencies(recs) if rare_words else None
-    return pl.concat([_keys_chunk(recs.slice(s, KEY_CHUNK), word_df) for s in range(0, recs.height, KEY_CHUNK)])
+def record_keys(recs: pl.DataFrame, uv3: bool = False) -> pl.DataFrame:
+    """(row, h) blocking keys of every record of one blocking frame; `recs` needs `row`, `core`, `addr`.
+    Main channel: address-word frequencies are counted over the whole frame first (one count per
+    record) so each record keeps its rarest words. `uv3` channel: words in address order."""
+    word_df = None if uv3 else pl.concat(
+        [_address_words(_tokens(tnorm(recs.slice(s, KEY_CHUNK)), "addr")).unique()
+         for s in range(0, recs.height, KEY_CHUNK)]).group_by("h").agg(pl.len().alias("wdf"))
+    return pl.concat([_keys_chunk(recs.slice(s, KEY_CHUNK), word_df, uv3) for s in range(0, recs.height, KEY_CHUNK)])
 
 
 def key_matrix(keys: pl.DataFrame, n_rows: int, max_df: int) -> sp.csr_matrix:
@@ -149,9 +206,10 @@ def search(q: sp.csr_matrix, t: sp.csr_matrix, k: int) -> tuple[np.ndarray, np.n
     return tuple(np.concatenate(x) for x in zip(*res))
 
 
-def generate(recs: pl.DataFrame, k: int, k_rev: int, max_df: int) -> pl.DataFrame:
+def generate(recs: pl.DataFrame, k: int, k_rev: int, max_df: int, uv3: bool = False) -> pl.DataFrame:
     """Candidate pairs (i, j, score): i a Source 1 row, j a Source 2/3 row, score the
-    key cosine. `recs` needs `row`, `src`, `country_key`, `core`, `addr`."""
+    key cosine. `recs` needs `row`, `src`, `country_key`, `core`, `addr`. `uv3` selects the
+    second key channel (measured: k=3, k_rev=3, max_df=1000 next to the main k=10, k_rev=3, 3000)."""
     parts = []
     base = recs.select("row", "src", "country_key", "core", "addr")
     for country in base["country_key"].unique(maintain_order=True).to_list():
@@ -167,7 +225,7 @@ def generate(recs: pl.DataFrame, k: int, k_rev: int, max_df: int) -> pl.DataFram
             # Local frame: Source 1 rows first, then the target source.
             local = pl.concat([q_rows, t_rows])
             glob = local["row"].to_numpy()
-            keys = record_keys(local.with_columns(pl.int_range(pl.len(), dtype=pl.UInt32).alias("row")))
+            keys = record_keys(local.with_columns(pl.int_range(pl.len(), dtype=pl.UInt32).alias("row")), uv3)
             t_keys = time.time()
             m = key_matrix(keys, local.height, max_df)
             del keys

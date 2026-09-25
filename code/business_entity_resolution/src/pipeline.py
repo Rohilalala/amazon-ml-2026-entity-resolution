@@ -340,6 +340,23 @@ def provenance(data_dir: Path, split: str) -> dict:
 
 # ---------------------------------------------------------------- entry points
 
+def evaluate_blocking(data_dir: Path, cfg: Config, cache: Path | None = None) -> dict:
+    """Candidate generation on the training split only: pair recall and F0.5
+    ceiling per country, without training a matcher."""
+    raw = data.load_split(data_dir, "train")
+    truth = data.load_truth(data_dir / "train" / "train_ground_truth.tsv", raw)
+    prov = provenance(data_dir, "train")
+    native = indic.learn_dictionary(raw, truth)
+    text.set_native_words(native)
+    recs, pairs = candidate_table(raw, cfg, {**prov["inputs"], "native_words": _dict_hash(native)}, cache)
+    pairs = pairs.select("i", "j").join(truth.with_columns(pl.lit(1, dtype=pl.Int8).alias("y")),
+                                        on=["i", "j"], how="left").with_columns(pl.col("y").fill_null(0))
+    s1 = recs.filter(pl.col("src") == 1).select("row", "country_key")
+    n_true = s1.join(truth.group_by("i").len("n_true"), left_on="row", right_on="i", how="left") \
+        .with_columns(pl.col("n_true").fill_null(0))
+    return _blocking_report(pairs, n_true)
+
+
 def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path | None = None) -> Bundle:
     """Candidates for the whole training split, a matcher cross-validated on a
     sample of Source 1 records, and the decision rule that maximises macro F0.5."""

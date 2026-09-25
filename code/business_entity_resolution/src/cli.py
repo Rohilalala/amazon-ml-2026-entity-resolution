@@ -3,6 +3,7 @@
     python -m src.cli train   --data DATA --model artifacts/model
     python -m src.cli predict --data DATA --model artifacts/model --out OUTPUT
     python -m src.cli run     --data DATA --model artifacts/model --out OUTPUT
+    python -m src.cli block   --data DATA          (candidate recall on train, no training)
 
 DATA is the dataset/ folder holding train/ and test/. `run` = train + predict.
 Exit codes: 0 success, 2 bad input or output data.
@@ -44,13 +45,13 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m src.cli", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
-    for name in ("train", "predict", "run"):
+    for name in ("train", "predict", "run", "block"):
         p = sub.add_parser(name)
         p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
         p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
         p.add_argument("--cache", type=Path, default=None,
                        help="reuse prepared records and candidates across runs (keyed on data, settings and code)")
-        if name != "train":
+        if name in ("predict", "run"):
             p.add_argument("--out", type=Path, required=True, help="output folder for the TSVs")
         if name != "predict":
             d = Config()
@@ -66,7 +67,10 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
-        if args.command == "train":
+        if args.command == "block":
+            report = pipeline.evaluate_blocking(args.data, _config(args), cache=args.cache)
+            print(json.dumps(report, indent=2))
+        elif args.command == "train":
             _train(args)
         elif args.command == "predict":
             _predict(args)

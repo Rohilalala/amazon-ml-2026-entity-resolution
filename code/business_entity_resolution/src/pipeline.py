@@ -22,7 +22,7 @@ import numpy as np
 import polars as pl
 from sklearn.model_selection import GroupKFold
 
-from . import candidates, data, features
+from . import candidates, data, features, indic, text
 from .config import Config
 from .metric import f05_counts
 
@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 THRESHOLDS = np.round(np.arange(0.05, 0.96, 0.01), 2)
 MISSED_GRID = (0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
 BUNDLE_FILE = "bundle.json"
+NATIVE_FILE = "native_words.json"
 PACKAGES = ("numpy", "polars", "scipy", "scikit-learn", "lightgbm", "rapidfuzz", "anyascii")
 NON_FEATURES = {"i", "j", "y", "jsrc"}
 
@@ -203,6 +204,7 @@ class Bundle:
     stages: list[Stage]
     rule: dict
     report: dict
+    native_words: dict | None = None  # Indic -> English dictionary learned in training
     oof: pl.DataFrame | None = None  # out-of-fold predictions, saved for error analysis
 
     def save(self, directory: Path) -> None:
@@ -217,6 +219,8 @@ class Bundle:
             stages.append({"features": stage.features, "models": files})
         meta = {"config": self.config.to_dict(), "stages": stages, "rule": self.rule, "report": self.report}
         (directory / BUNDLE_FILE).write_text(json.dumps(meta, indent=2))
+        (directory / NATIVE_FILE).write_text(json.dumps(self.native_words or {}, ensure_ascii=False,
+                                                        sort_keys=True), encoding="utf-8")
         if self.oof is not None:
             self.oof.write_parquet(directory / "oof.parquet")
         log.info("saved bundle to %s", directory)
@@ -233,7 +237,9 @@ class Bundle:
             if any(b.num_feature() != len(st["features"]) for b in boosters):
                 raise data.DataError(f"{directory}: model features do not match the bundle")
             stages.append(Stage(st["features"], boosters))
-        return cls(Config.from_dict(meta["config"]), stages, meta["rule"], meta["report"])
+        native = directory / NATIVE_FILE
+        words = json.loads(native.read_text(encoding="utf-8")) if native.is_file() else {}
+        return cls(Config.from_dict(meta["config"]), stages, meta["rule"], meta["report"], words)
 
 
 def score_pairs(recs: pl.DataFrame, pairs: pl.DataFrame, stage: Stage, size: int) -> np.ndarray:
@@ -252,6 +258,10 @@ def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size
         ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", prob)))
         prob = score_pairs(recs, pl.concat([pairs, ctx.drop("i", "j")], how="horizontal"), stages[1], size)
     return prob
+
+
+def _dict_hash(d: dict) -> str:
+    return hashlib.sha256(json.dumps(d, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _sha256(path: Path) -> str:
@@ -284,7 +294,10 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     raw = data.load_split(data_dir, "train")
     truth = data.load_truth(data_dir / "train" / "train_ground_truth.tsv", raw)
     prov = provenance(data_dir, "train")
-    recs, pairs = candidate_table(raw, cfg, prov["inputs"], cache)
+    native = indic.learn_dictionary(raw, truth)
+    text.set_native_words(native)
+    log.info("learned %d Indic -> English dictionary entries", len(native))
+    recs, pairs = candidate_table(raw, cfg, {**prov["inputs"], "native_words": _dict_hash(native)}, cache)
     del raw
     pairs = pairs.join(truth.with_columns(pl.lit(1, dtype=pl.Int8).alias("y")), on=["i", "j"], how="left") \
         .with_columns(pl.col("y").fill_null(0))
@@ -375,7 +388,7 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         report["unseen_country_stage1"] = transfer
     report["holdout"] = holdout_report
     report["train_seconds"] = round(time.time() - t_start, 1)
-    bundle = Bundle(cfg, stages, rule, report)
+    bundle = Bundle(cfg, stages, rule, report, native)
     bundle.oof = table.select("i", "j", "y").with_columns(
         pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes))
     return bundle
@@ -454,7 +467,9 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None
     submission rules. Returns (ids, match lists, candidate lists, report)."""
     raw = data.load_split(data_dir, "test")
     prov = provenance(data_dir, "test")
-    recs, pairs = candidate_table(raw, bundle.config, prov["inputs"], cache)
+    native = bundle.native_words or {}
+    text.set_native_words(native)
+    recs, pairs = candidate_table(raw, bundle.config, {**prov["inputs"], "native_words": _dict_hash(native)}, cache)
     del raw
     t0 = time.time()
     prob = score_all(recs, pairs, bundle.stages, bundle.config.feature_chunk) if pairs.height else np.zeros(0)

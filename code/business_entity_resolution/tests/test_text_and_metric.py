@@ -88,3 +88,25 @@ def test_vectorised_metric_agrees_with_reference():
     counts = f05_counts([len(pred[i]) for i in ids], [len(truth[i]) for i in ids],
                         [len(pred[i] & truth[i]) for i in ids])
     assert counts.mean() == pytest.approx(f05_macro(pred, truth, ids))
+
+
+def test_indic_dictionary_is_learned_from_true_pairs_only():
+    from src import indic
+    raw = pl.DataFrame({
+        "row": [0, 1, 2, 3],
+        "business_name": ["Jai Healthcare Private Limited", "जय हेल्थकेयर प्राइवेट लिमिटेड",
+                          "Ram Traders", "राम ट्रेडर्स"],
+        "business_address": ["A-203, Ghaziabad, Uttar Pradesh", "A-203, उत्तर प्रदेश",
+                             "Pune, Maharashtra", "Pune"],
+    })
+    truth = pl.DataFrame({"i": [0, 2], "j": [1, 3]})
+    words = indic.learn_dictionary(raw, truth)
+    assert words["जय"] == "jai" and words["हेल्थकेयर"] == "healthcare"
+    assert words["राम"] == "ram" and words["ट्रेडर्स"] == "traders"
+    assert words["उत्तर प्रदेश"] == "uttar pradesh"
+    text.set_native_words(words)
+    try:
+        assert text.core_name(text.clean_name(pl.Series(["जय हेल्थकेयर प्राइवेट लिमिटेड"]))).item() == "jai healthcare"
+        assert text.clean_address(pl.Series(["उत्तर प्रदेश"])).item() == "up"
+    finally:
+        text.set_native_words({})

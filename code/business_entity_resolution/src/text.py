@@ -9,6 +9,8 @@ ASCII first; the phonetic `skeleton` then absorbs most spelling differences
 between a transliteration and the English spelling
 ("helthkeyr" / "healthcare" -> "ltkr").
 """
+import re
+
 import polars as pl
 from anyascii import anyascii
 
@@ -32,7 +34,7 @@ NAME_ABBREV = {
 NAME_STOP = [
     "private", "limited", "llp", "llc", "lp", "plc", "incorporated", "corporation",
     "company", "companies", "the", "and", "of", "formerly", "dba", "aka",
-    "com", "www", "net", "org", "in", "ms", "m", "s", "shri", "sri", "shree", "smt",
+    "com", "www", "net", "org", "in", "ms", "m", "s", "shri", "sri", "shree", "sree", "smt",
     # French legal forms and articles (France appears only in the test set).
     "sarl", "sas", "sasu", "sa", "eurl", "snc", "sci", "et", "de", "la", "le",
     "les", "du", "des", "d", "l",
@@ -86,12 +88,39 @@ STATES = {
 _PLACEHOLDER = r"(?i)<null>|\bn/a\b|^\s*(none|null|nan|na)\s*$"
 
 
+# Indic word -> English word, learned from training data (see indic.py). Empty until
+# set_native_words() is called; then Indic words it covers are translated before
+# the generic anyascii transliteration handles everything else.
+_NATIVE: dict = {}
+_INDIC_RUN = re.compile(r"[\u0900-\u0DFF\u200c\u200d]+(?:\s+[\u0900-\u0DFF\u200c\u200d]+)*")
+_INDIC_WORD = re.compile(r"[\u0900-\u0DFF\u200c\u200d]+")
+
+
+def set_native_words(words: dict) -> None:
+    """Install the Indic -> English dictionary used by transliterate()."""
+    global _NATIVE
+    _NATIVE = dict(words)
+
+
+def _native_word(m: re.Match) -> str:
+    return f" {_NATIVE[m.group(0)]} " if m.group(0) in _NATIVE else m.group(0)
+
+
+def _native_run(m: re.Match) -> str:
+    run = m.group(0)  # whole runs first: multi-word state names such as उत्तर प्रदेश
+    return f" {_NATIVE[run]} " if run in _NATIVE else _INDIC_WORD.sub(_native_word, run)
+
+
+def _to_ascii(x: str) -> str:
+    return anyascii(_INDIC_RUN.sub(_native_run, x) if _NATIVE else x)
+
+
 def transliterate(s: pl.Series) -> pl.Series:
     """ASCII transliteration; only non-ASCII strings pay the Python-level cost."""
     idx = s.str.contains(r"[^\x00-\x7F]").arg_true()
     if len(idx) == 0:
         return s
-    return s.scatter(idx, s.gather(idx).map_elements(anyascii, return_dtype=pl.String))
+    return s.scatter(idx, s.gather(idx).map_elements(_to_ascii, return_dtype=pl.String))
 
 
 def is_non_latin(s: pl.Series) -> pl.Series:

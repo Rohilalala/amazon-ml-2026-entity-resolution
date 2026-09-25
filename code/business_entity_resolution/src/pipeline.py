@@ -12,6 +12,7 @@ import platform
 import resource
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from importlib import metadata
@@ -22,7 +23,7 @@ import numpy as np
 import polars as pl
 from sklearn.model_selection import GroupKFold
 
-from . import candidates, data, features, indic, text
+from . import alignment, candidates, data, features, groupfeat, indic, text
 from .config import Config
 from .metric import f05_counts
 
@@ -34,6 +35,8 @@ BUNDLE_FILE = "bundle.json"
 NATIVE_FILE = "native_words.json"
 PACKAGES = ("numpy", "polars", "scipy", "scikit-learn", "lightgbm", "rapidfuzz", "anyascii")
 NON_FEATURES = {"i", "j", "y", "jsrc"}
+# Stage 3 rescores only pairs whose stage-2 probability reaches this value.
+STAGE3_ACTIVE = 0.001
 
 
 # ---------------------------------------------------------------- stages
@@ -84,41 +87,57 @@ def candidate_table(raw: pl.DataFrame, cfg: Config, inputs: dict,
     return recs, pairs
 
 
-def feature_chunks(recs: pl.DataFrame, pairs: pl.DataFrame, size: int):
+def feature_chunks(recs: pl.DataFrame, pairs: pl.DataFrame, size: int, tables: dict):
     """Yield feature frames for consecutive chunks of `pairs`."""
     for s in range(0, pairs.height, size):
-        yield features.pair_features(recs, pairs.slice(s, size))
+        yield features.pair_features(recs, pairs.slice(s, size), tables)
 
 
-def build_features(recs, pairs, size) -> pl.DataFrame:
+def build_matrix(recs, pairs, size, tables) -> tuple[np.ndarray, list[str]]:
+    """Feature matrix for `pairs` (row order kept), filled chunk by chunk so only one
+    chunk's feature frame is alive at a time."""
     t0 = time.time()
-    out = pl.concat(list(feature_chunks(recs, pairs, size))) if pairs.height else pairs
+    X, names = None, None
+    for s, f in zip(range(0, pairs.height, size), feature_chunks(recs, pairs, size, tables)):
+        if X is None:
+            names = [c for c in f.columns if c not in NON_FEATURES]
+            X = np.empty((pairs.height, len(names)), dtype=np.float32)
+        X[s:s + f.height] = matrix(f, names)
     log.info("features for %d pairs in %.1fs (peak %.1f GB)", pairs.height, time.time() - t0, peak_gb())
-    return out
+    return X, names
 
 
 def matrix(frame: pl.DataFrame, names: list[str]) -> np.ndarray:
     return frame.select(names).to_numpy().astype(np.float32, copy=False)
 
 
-def fit(X, y, cfg: Config, valid=None, rounds=None) -> lgb.Booster:
+def fit(X, y, cfg: Config, valid=None, rounds=None, stage: int = 1) -> lgb.Booster:
     """One LightGBM model: early-stopped on `valid`, or a fixed number of rounds."""
     train_set = lgb.Dataset(X, y, free_raw_data=True)
     if valid is None:
-        return lgb.train(cfg.lgb(), train_set, rounds)
-    return lgb.train(cfg.lgb(), train_set, cfg.num_boost_round,
+        return lgb.train(cfg.lgb(stage), train_set, rounds)
+    return lgb.train(cfg.lgb(stage), train_set, cfg.num_boost_round,
                      valid_sets=[lgb.Dataset(valid[0], valid[1], reference=train_set)],
                      callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)])
 
 
-def cross_validate(X, y, groups, cfg: Config) -> tuple[np.ndarray, list[lgb.Booster]]:
-    """Out-of-fold probabilities, folds grouped by Source 1 record so no record's
-    pairs are split between training and validation."""
-    oof, boosters = np.zeros(len(y), dtype=np.float64), []
+def fold_ids(groups: np.ndarray, cfg: Config) -> np.ndarray:
+    """Fold of every pair, grouped by Source 1 record so no record's pairs are split
+    between training and validation. Computed once and shared by all stages."""
+    folds = np.empty(len(groups), dtype=np.int8)
     splitter = GroupKFold(n_splits=cfg.folds, shuffle=True, random_state=cfg.seed)
-    for n, (tr, va) in enumerate(splitter.split(X, y, groups)):
+    for n, (_, va) in enumerate(splitter.split(groups, groups=groups)):
+        folds[va] = n
+    return folds
+
+
+def cross_validate(X, y, folds, cfg: Config, stage: int = 1) -> tuple[np.ndarray, list[lgb.Booster]]:
+    """Out-of-fold probabilities over the given fold assignment."""
+    oof, boosters = np.zeros(len(y), dtype=np.float64), []
+    for n in range(cfg.folds):
+        tr, va = np.flatnonzero(folds != n), np.flatnonzero(folds == n)
         t0 = time.time()
-        b = fit(X[tr], y[tr], cfg, valid=(X[va], y[va]))
+        b = fit(X[tr], y[tr], cfg, valid=(X[va], y[va]), stage=stage)
         oof[va] = b.predict(X[va], num_iteration=b.best_iteration)
         boosters.append(b)
         log.info("fold %d/%d: %d rounds in %.0fs", n + 1, cfg.folds, b.best_iteration, time.time() - t0)
@@ -242,21 +261,55 @@ class Bundle:
         return cls(Config.from_dict(meta["config"]), stages, meta["rule"], meta["report"], words)
 
 
-def score_pairs(recs: pl.DataFrame, pairs: pl.DataFrame, stage: Stage, size: int) -> np.ndarray:
+def score_pairs(recs: pl.DataFrame, pairs: pl.DataFrame, stage: Stage, size: int, tables: dict,
+                store: np.ndarray | None = None) -> np.ndarray:
     """Probabilities of one stage for every pair; features are built chunk by
-    chunk and discarded, so memory stays flat whatever the number of pairs."""
+    chunk, so memory stays flat whatever the number of pairs. With `store`, each
+    chunk's feature rows are also written there for reuse by the next stage."""
     out = np.empty(pairs.height, dtype=np.float32)
-    for s, f in zip(range(0, pairs.height, size), feature_chunks(recs, pairs, size)):
-        out[s:s + f.height] = stage.predict(matrix(f, stage.features))
+    for s, f in zip(range(0, pairs.height, size), feature_chunks(recs, pairs, size, tables)):
+        x = matrix(f, stage.features)
+        if store is not None:
+            store[s:s + len(x)] = x
+        out[s:s + len(x)] = stage.predict(x)
     return out
 
 
-def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size: int) -> np.ndarray:
-    """Final probabilities: stage 1, then (if present) stage 2 on stage-1 context."""
-    prob = score_pairs(recs, pairs, stages[0], size)
-    if len(stages) > 1:
-        ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", prob)))
-        prob = score_pairs(recs, pl.concat([pairs, ctx.drop("i", "j")], how="horizontal"), stages[1], size)
+def _stage3_frame(ij: pl.DataFrame, prob: np.ndarray, recs: pl.DataFrame) -> pl.DataFrame:
+    """Stage-3 inputs: the stage-2 probability ('oof') first, then the group features."""
+    f3 = groupfeat.stage3_features(ij.with_columns(pl.Series("oof", prob)), recs, "oof")
+    return f3.select(pl.Series("oof", prob.astype(np.float32)), pl.exclude("i", "j", "oof"))
+
+
+def stage3_scores(recs: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, stage: Stage) -> np.ndarray:
+    """Stage-3 probabilities: pairs at or above STAGE3_ACTIVE are rescored from
+    group features; the rest keep their stage-2 probability."""
+    act = prob >= STAGE3_ACTIVE
+    f3 = _stage3_frame(pairs.select("i", "j").filter(pl.Series(act)), prob[act], recs)
+    out = prob.copy()
+    out[act] = stage.predict(matrix(f3, stage.features))
+    return out
+
+
+def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size: int, tables: dict) -> np.ndarray:
+    """Final probabilities through every stage. Stage-1 features are kept in a
+    disk-backed array so stage 2 appends its context instead of recomputing them."""
+    n, first = pairs.height, stages[0]
+    with tempfile.TemporaryDirectory(prefix="ber-features-") as tmp:
+        store = np.lib.format.open_memmap(Path(tmp) / "stage1.npy", mode="w+", dtype=np.float32,
+                                          shape=(n, len(first.features))) if len(stages) > 1 else None
+        prob = score_pairs(recs, pairs, first, size, tables, store)
+        if len(stages) > 1:
+            second = stages[1]
+            if second.features[:len(first.features)] != first.features:
+                raise data.DataError("stage-2 features must extend the stage-1 features")
+            ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", prob)))
+            extra = ctx.select(second.features[len(first.features):]).to_numpy().astype(np.float32)
+            for s in range(0, n, size):
+                prob[s:s + size] = second.predict(np.hstack([store[s:s + size], extra[s:s + size]]))
+            del store
+    if len(stages) > 2:
+        prob = stage3_scores(recs, pairs, prob, stages[2])
     return prob
 
 
@@ -315,39 +368,56 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     code_of = np.full(recs.height, -1, dtype=np.int64)
     code_of[sample["row"].to_numpy()] = np.arange(sample.height)
     in_sample = pairs["i"].is_in(sample["row"].implode()).to_numpy()
-    table = build_features(recs, pairs.filter(pl.Series(in_sample)), cfg.feature_chunk)
-    names = [c for c in table.columns if c not in NON_FEATURES]
-    X, y = matrix(table, names), table["y"].to_numpy()
-    codes = code_of[table["i"].to_numpy()]
+    tables = alignment.pool_tables(recs)
+    ids = pairs.filter(pl.Series(in_sample)).select("i", "j", "y")
+    X, names = build_matrix(recs, pairs.filter(pl.Series(in_sample)), cfg.feature_chunk, tables)
+    y = ids["y"].to_numpy()
+    codes = code_of[ids["i"].to_numpy()]
+    folds = fold_ids(codes, cfg)
     n_true = sample["n_true"].to_numpy()
     log.info("training sample: %d Source 1 records, %d pairs, %d features, %d positives",
              sample.height, len(y), len(names), int(y.sum()))
 
-    oof, boosters = cross_validate(X, y, codes, cfg)
+    oof, boosters = cross_validate(X, y, folds, cfg)
     stages = [Stage(names, boosters)]
-    stage1_score = choose_rule(codes, n_true, oof, y)[0]
-    log.info("stage 1 out-of-fold macro F0.5 %.4f", stage1_score)
+    stage_scores = [choose_rule(codes, n_true, oof, y)[0]]
+    log.info("stage 1 out-of-fold macro F0.5 %.4f", stage_scores[-1])
     country = sample["country_key"].to_numpy()
     if country_check:  # on stage-1 features, whose inputs never saw the held-out country
         transfer = _country_transfer(X, y, codes, n_true, country, cfg,
                                      max(1, int(np.mean([b.best_iteration for b in boosters]))))
 
+    full_ctx = None
     if cfg.stages > 1:
         # Stage-1 probabilities for every training pair: out-of-fold for the sample,
         # fold-model average for pairs of Source 1 records outside the sample.
         t0 = time.time()
         p1 = np.empty(pairs.height, dtype=np.float32)
         p1[in_sample] = oof
-        p1[~in_sample] = score_pairs(recs, pairs.filter(pl.Series(~in_sample)), stages[0], cfg.feature_chunk)
+        p1[~in_sample] = score_pairs(recs, pairs.filter(pl.Series(~in_sample)), stages[0], cfg.feature_chunk, tables)
         full_ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", p1)))
         ctx = full_ctx.filter(pl.Series(in_sample)).drop("i", "j")
         log.info("stage-1 context for %d pairs in %.0fs (peak %.1f GB)", pairs.height, time.time() - t0, peak_gb())
-        del X
-        table = pl.concat([table, ctx], how="horizontal")
+        X = np.hstack([X, ctx.to_numpy().astype(np.float32)])
         names = names + ctx.columns
-        X = matrix(table, names)
-        oof, boosters = cross_validate(X, y, codes, cfg)
+        del ctx
+        oof, boosters = cross_validate(X, y, folds, cfg, stage=2)
         stages.append(Stage(names, boosters))
+        stage_scores.append(choose_rule(codes, n_true, oof, y)[0])
+        log.info("stage 2 out-of-fold macro F0.5 %.4f", stage_scores[-1])
+    del X
+
+    if cfg.stages > 2:
+        # Group features over the stage-2 out-of-fold probabilities, same folds.
+        act = oof >= STAGE3_ACTIVE
+        f3 = _stage3_frame(ids.select("i", "j").filter(pl.Series(act)), oof[act], recs)
+        names3 = f3.columns
+        oof3, boosters3 = cross_validate(matrix(f3, names3), y[act], folds[act], cfg, stage=3)
+        oof = oof.copy()
+        oof[act] = oof3
+        stages.append(Stage(names3, boosters3))
+        stage_scores.append(choose_rule(codes, n_true, oof, y)[0])
+        log.info("stage 3 out-of-fold macro F0.5 %.4f (%d active pairs)", stage_scores[-1], int(act.sum()))
 
     score, rule, trials = choose_rule(codes, n_true, oof, y)
     log.info("out-of-fold macro F0.5 %.4f with rule %s; best trials %s", score, rule, trials)
@@ -356,12 +426,13 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         in_hold = pairs["i"].is_in(holdout["row"].implode()).to_numpy()
         hp = pairs.filter(pl.Series(in_hold))
         if len(stages) > 1:
-            hp = pl.concat([hp, full_ctx.filter(pl.Series(in_hold)).drop("i", "j")], how="horizontal")
-        h_prob = score_pairs(recs, hp, stages[-1], cfg.feature_chunk)
+            h_prob = score_pairs(recs, pl.concat([hp, full_ctx.filter(pl.Series(in_hold)).drop("i", "j")],
+                                                 how="horizontal"), stages[1], cfg.feature_chunk, tables)
+        else:
+            h_prob = score_pairs(recs, hp, stages[0], cfg.feature_chunk, tables)
+        if len(stages) > 2:
+            h_prob = stage3_scores(recs, hp, h_prob, stages[2])
         holdout_report = _holdout_report(hp, h_prob, holdout, rule)
-        if len(stages) > 1:
-            holdout_report["stage1"] = _holdout_report(hp, p1[in_hold], holdout, choose_rule(
-                codes, n_true, p1[in_sample], y)[1])["f05"]
         log.info("HOLDOUT (never trained on, scored like the test set): %s", holdout_report)
     keep = apply_rule(rule, codes, oof)
     by_country = {}
@@ -373,15 +444,16 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         by_country[str(c)] = round(macro_f05(remap[codes[mask]], n_true[ent], keep[mask], y[mask]), 5)
     log.info("out-of-fold macro F0.5 by country: %s", by_country)
 
-    gain = np.mean([b.feature_importance("gain") for b in boosters], axis=0)
     report = {
         "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "blocking": blocking,
         "sample_s1": sample.height, "sample_pairs": len(y), "sample_positives": int(y.sum()),
-        "stage1_oof_f05": round(stage1_score, 5),
+        "oof_f05_by_stage": [round(v, 5) for v in stage_scores],
         "oof_f05": round(score, 5), "rule": rule, "rule_trials": trials, "oof_f05_by_country": by_country,
         "fold_rounds": [[b.best_iteration for b in st.boosters] for st in stages],
-        "feature_gain": dict(sorted(zip(names, gain.round(1).tolist()), key=lambda kv: -kv[1])),
+        "feature_gain": [dict(sorted(zip(st.features, np.mean([b.feature_importance("gain") for b in st.boosters],
+                                                               axis=0).round(1).tolist()), key=lambda kv: -kv[1]))
+                         for st in stages],
         "provenance": prov,
     }
     if country_check:
@@ -389,8 +461,7 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     report["holdout"] = holdout_report
     report["train_seconds"] = round(time.time() - t_start, 1)
     bundle = Bundle(cfg, stages, rule, report, native)
-    bundle.oof = table.select("i", "j", "y").with_columns(
-        pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes))
+    bundle.oof = ids.with_columns(pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes))
     return bundle
 
 
@@ -445,7 +516,7 @@ def _country_transfer(X, y, codes, n_true, country, cfg, rounds) -> dict:
         tr_remap = np.full(len(country), -1)
         tr_remap[tr_ent] = np.arange(len(tr_ent))
         tr_codes = tr_remap[codes[~held]]
-        inner = cross_validate(X[~held], y[~held], tr_codes, cfg)[0]
+        inner = cross_validate(X[~held], y[~held], fold_ids(tr_codes, cfg), cfg)[0]
         rule = choose_rule(tr_codes, n_true[tr_ent], inner, y[~held])[1]
         b = fit(X[~held], y[~held], cfg, rounds=rounds)
         prob = b.predict(X[held])
@@ -472,7 +543,9 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None
     recs, pairs = candidate_table(raw, bundle.config, {**prov["inputs"], "native_words": _dict_hash(native)}, cache)
     del raw
     t0 = time.time()
-    prob = score_all(recs, pairs, bundle.stages, bundle.config.feature_chunk) if pairs.height else np.zeros(0)
+    tables = alignment.pool_tables(recs)
+    prob = score_all(recs, pairs, bundle.stages, bundle.config.feature_chunk, tables) \
+        if pairs.height else np.zeros(0)
     log.info("scored %d pairs with %d stage(s) in %.1fs (peak %.1f GB)", pairs.height, len(bundle.stages),
              time.time() - t0, peak_gb())
     if bundle.config.exclusive:

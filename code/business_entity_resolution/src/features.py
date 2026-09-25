@@ -8,10 +8,10 @@ import polars as pl
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler, Levenshtein
 
-from . import text
+from . import alignment, text
 
 RECORD_COLUMNS = ["name", "core", "addr", "skel", "concat", "acr", "house", "src",
-                   "name_non_latin", "addr_non_latin"]
+                  "name_non_latin", "addr_non_latin", "country_key"]
 PREPARE_CHUNK = 1_000_000
 
 
@@ -121,9 +121,10 @@ def _house_features(a: pl.Series, b: pl.Series) -> dict:
     }
 
 
-def pair_features(recs: pl.DataFrame, pairs: pl.DataFrame) -> pl.DataFrame:
+def pair_features(recs: pl.DataFrame, pairs: pl.DataFrame, tables: dict | None = None) -> pl.DataFrame:
     """String-similarity features for one chunk of pairs, plus the context
-    columns already on `pairs`. `recs` is the prepared frame (row-aligned)."""
+    columns already on `pairs`. `recs` is the prepared frame (row-aligned);
+    `tables` (alignment.pool_tables of the same split) adds the alignment features."""
     i, j = pairs["i"].to_numpy(), pairs["j"].to_numpy()
     a = recs.select(RECORD_COLUMNS)[i]
     b = recs.select(RECORD_COLUMNS)[j]
@@ -167,5 +168,7 @@ def pair_features(recs: pl.DataFrame, pairs: pl.DataFrame) -> pl.DataFrame:
     f["is_s3"] = (b["src"].to_numpy() == 3).astype(np.float32)
     f["name_non_latin"] = b["name_non_latin"].to_numpy().astype(np.float32)
     f["addr_non_latin"] = b["addr_non_latin"].to_numpy().astype(np.float32)
+    if tables is not None:
+        f.update(alignment.pair_features(a, b, tables))
     return pairs.drop("jsrc", strict=False).with_columns(
         [pl.Series(k, v) for k, v in f.items()])

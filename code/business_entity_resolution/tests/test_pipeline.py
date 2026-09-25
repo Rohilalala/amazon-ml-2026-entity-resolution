@@ -25,7 +25,7 @@ def trained(dataset, tmp_path_factory):
     model_dir = tmp_path_factory.mktemp("model")
     out_dir = tmp_path_factory.mktemp("output")
     code = cli.main(["run", "--data", str(dataset), "--model", str(model_dir),
-                     "--out", str(out_dir), "--folds", "3"])
+                     "--out", str(out_dir), "--folds", "3", "--sample", "300"])
     assert code == 0
     return model_dir, out_dir
 
@@ -71,7 +71,9 @@ def test_model_quality_and_unseen_country(trained):
     report = pipeline.Bundle.load(model_dir).report
     assert report["blocking"]["pair_recall"] > 0.95
     assert report["oof_f05"] > 0.9
-    assert report["oof_f05"] >= report["stage1_oof_f05"] - 0.01
+    assert len(report["oof_f05_by_stage"]) == 3
+    assert report["oof_f05"] >= report["oof_f05_by_stage"][0] - 0.01
+    assert report["holdout"]["f05"] > 0.85
     assert set(report["unseen_country_stage1"]) == {"us", "india"}
     for v in report["unseen_country_stage1"].values():
         assert v["f05_with_rule_from_other_country"] > 0.85
@@ -99,8 +101,10 @@ def test_bundle_round_trip_keeps_config(trained):
     bundle = pipeline.Bundle.load(model_dir)
     assert bundle.config.folds == 3
     assert bundle.rule["kind"] in {"threshold", "expected_f05"}
-    assert [len(st.boosters) for st in bundle.stages] == [3, 3]
-    assert set(bundle.stages[0].features) < set(bundle.stages[1].features)
+    assert [len(st.boosters) for st in bundle.stages] == [3, 3, 3]
+    assert bundle.stages[1].features[:len(bundle.stages[0].features)] == bundle.stages[0].features
+    assert any(f.startswith("tok_") for f in bundle.stages[0].features)  # alignment features in use
+    assert bundle.stages[2].features[0] == "oof"
 
 
 def test_bad_prefix_is_rejected(dataset, tmp_path):

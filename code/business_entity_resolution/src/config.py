@@ -33,7 +33,7 @@ class Config:
     max_df: int = 1000
     # Training: Source 1 records sampled for the matcher (their candidates
     # come from the full pool), cross-validation folds, feature chunk size.
-    train_s1_sample: int = 400_000
+    train_s1_sample: int = 500_000
     # Source 1 records kept out of both stages and scored exactly like the test
     # set: an unbiased estimate of the leaderboard (per country).
     holdout_s1: int = 100_000
@@ -41,14 +41,16 @@ class Config:
     feature_chunk: int = 1_000_000
     seed: int = 42
     num_boost_round: int = 3000
-    # 2 = a second matcher that also sees how each pair's stage-1 probability
-    # compares with its competitors on both sides.
-    stages: int = 2
+    # Stage 2 also sees how each pair's stage-1 probability compares with its
+    # competitors on both sides; stage 3 compares each candidate with the other
+    # likely members of its Source 1 record's group (groupfeat.py).
+    stages: int = 3
     early_stopping_rounds: int = 100
     # Decision: each Source 2/3 record goes to its most likely Source 1 record
     # only (the training ground truth never assigns one record to two).
     exclusive: bool = True
     lgb_params: dict = field(default_factory=_default_lgb_params)
+    stage3_lgb_params: dict = field(default_factory=lambda: {"learning_rate": 0.05, "num_leaves": 63})
 
     def to_dict(self):
         return asdict(self)
@@ -57,6 +59,7 @@ class Config:
     def from_dict(cls, d):
         return cls(**d)
 
-    def lgb(self):
-        """LightGBM parameters with the run seed applied."""
-        return {**self.lgb_params, "seed": self.seed}
+    def lgb(self, stage: int = 1):
+        """LightGBM parameters for a stage, with the run seed applied."""
+        extra = self.stage3_lgb_params if stage == 3 else {}
+        return {**self.lgb_params, **extra, "seed": self.seed}

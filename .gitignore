@@ -8,3 +8,4 @@ student_resource/
 logs/
 cache/
 output_v*/
+build/

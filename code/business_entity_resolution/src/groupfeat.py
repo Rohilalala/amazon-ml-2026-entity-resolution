@@ -98,13 +98,13 @@ def group_features(pairs: pl.DataFrame, recs: pl.DataFrame, pcol: str = "p") -> 
     eq_addr = ((x["addr_c"] == x["addr_a"]) & (x["addr_c"] != "")).to_numpy().astype(np.float32)
     eq_core = (x["core_c"] == x["core_a"]).to_numpy().astype(np.float32)
     # the anchor's own similarity to S1: is c closer to the anchor than the anchor is to S1?
-    ai = x.select("i", "a").unique().join(r.select(pl.col("row").alias("a"), pl.col("core").alias("ca"), pl.col("addr").alias("aa")), on="a") \
+    anchor_pairs = x.select("i", "a").unique().join(r.select(pl.col("row").alias("a"), pl.col("core").alias("ca"), pl.col("addr").alias("aa")), on="a") \
         .join(r.select(pl.col("row").alias("i"), pl.col("core").alias("ci"), pl.col("addr").alias("ad")), on="i")
-    sn = _cp(ai["ca"].to_list(), ai["ci"].to_list(), fuzz.token_set_ratio)
-    sa = _cp(ai["aa"].to_list(), ai["ad"].to_list(), fuzz.token_sort_ratio)
-    emp = ((ai["aa"] == "") | (ai["ad"] == "")).to_numpy()
-    ai = ai.select("i", "a", pl.Series("s_ai", np.where(emp, sn, (sn + sa) / 2).astype(np.float32)))
-    s_ai = x.select("i", "a").join(ai, on=["i", "a"], how="left", maintain_order="left")["s_ai"].to_numpy()
+    sn = _cp(anchor_pairs["ca"].to_list(), anchor_pairs["ci"].to_list(), fuzz.token_set_ratio)
+    sa = _cp(anchor_pairs["aa"].to_list(), anchor_pairs["ad"].to_list(), fuzz.token_sort_ratio)
+    emp = ((anchor_pairs["aa"] == "") | (anchor_pairs["ad"] == "")).to_numpy()
+    anchor_pairs = anchor_pairs.select("i", "a", pl.Series("s_ai", np.where(emp, sn, (sn + sa) / 2).astype(np.float32)))
+    s_ai = x.select("i", "a").join(anchor_pairs, on=["i", "a"], how="left", maintain_order="left")["s_ai"].to_numpy()
     # house of c equals house of anchor, where c's house differs from S1's
     h_dev = ((x["h_c"] != x["h_i"]) & (x["h_c"] != "")).to_numpy()
     h_dev_sup = np.where(h_dev & h_known, (x["h_c"] == x["h_a"]).to_numpy(), np.nan).astype(np.float32)

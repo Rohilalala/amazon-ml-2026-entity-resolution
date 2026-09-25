@@ -60,6 +60,12 @@ class Config:
     # is unseen, so both are decided on stage 2.
     stage3_use: str = "none"
     stage3_by_country: dict = field(default_factory=lambda: {"india": "full"})
+    # Predict-time clips on stage-1/2 feature columns, e.g. {"amb_s23_addr_2": 1.0},
+    # applied to pairs of feature_cap_countries (empty = every country). The test
+    # pool's decoy copy groups inflate this ambiguity count into false
+    # copy-consensus; the cap restores its training-time meaning.
+    feature_caps: dict = field(default_factory=dict)
+    feature_cap_countries: list = field(default_factory=list)
     lgb_params: dict = field(default_factory=_default_lgb_params)
     stage3_lgb_params: dict = field(default_factory=lambda: {"learning_rate": 0.05, "num_leaves": 63})
 

@@ -36,6 +36,11 @@ def _train(args) -> pipeline.Bundle:
 
 def _predict(args, bundle=None) -> None:
     bundle = bundle or pipeline.Bundle.load(args.model)
+    if getattr(args, "feature_cap", None):
+        caps = {k: float(v) for k, v in (item.split("=", 1) for item in args.feature_cap)}
+        bundle.config = dataclasses.replace(bundle.config, feature_caps=caps,
+                                            feature_cap_countries=(args.cap_countries or "").split(",")
+                                            if args.cap_countries else [])
     _, matches, cands, report = pipeline.predict(args.data, bundle, cache=args.cache, bundle_dir=args.model)
     _write(args, matches, cands, report)
 
@@ -79,6 +84,11 @@ def main(argv=None) -> int:
         p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
         p.add_argument("--cache", type=Path, default=None,
                        help="reuse prepared records and candidates across runs (keyed on data, settings and code)")
+        if name == "predict":
+            p.add_argument("--feature-cap", action="append", default=None, metavar="NAME=VALUE",
+                           help="clip a stage-1/2 feature at predict time, e.g. amb_s23_addr_2=1 (repeatable)")
+            p.add_argument("--cap-countries", default=None,
+                           help="comma-separated countries the caps apply to (default: all)")
         if name in ("predict", "run", "decide"):
             p.add_argument("--out", type=Path, required=True, help="output folder for the TSVs")
         if name == "decide":

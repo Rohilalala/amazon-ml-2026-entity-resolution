@@ -343,14 +343,36 @@ class Bundle:
                    meta["report"], words, {k: stage(v) for k, v in meta.get("variants", {}).items()})
 
 
+def apply_feature_caps(x: np.ndarray, names: list[str], caps: dict, mask: np.ndarray | None) -> None:
+    """Clip the named feature columns of `x` in place, on `mask` rows (all when None).
+
+    Test pools can carry a pattern at a density training never saw: decoy copy
+    groups make amb_s23_addr_2 read like copy-consensus. A predict-time cap
+    restores the training-time meaning of the feature for the chosen countries.
+    """
+    for name, cap in caps.items():
+        if name in names:
+            col = names.index(name)
+            if mask is None:
+                np.minimum(x[:, col], cap, out=x[:, col])
+            else:
+                x[mask, col] = np.minimum(x[mask, col], cap)
+
+
 def score_pairs(recs: pl.DataFrame, pairs: pl.DataFrame, stage: Stage, size: int, tables: dict,
-                store: np.ndarray | None = None) -> np.ndarray:
+                store: np.ndarray | None = None, caps: dict | None = None,
+                cap_mask: np.ndarray | None = None) -> np.ndarray:
     """Probabilities of one stage for every pair; features are built chunk by
     chunk, so memory stays flat whatever the number of pairs. With `store`, each
-    chunk's feature rows are also written there for reuse by the next stage."""
+    chunk's feature rows are also written there for reuse by the next stage.
+    `caps` clips feature columns (on `cap_mask` rows) before prediction and
+    before storing, so later stages see the capped values too."""
     out = np.empty(pairs.height, dtype=np.float32)
     for s, f in zip(range(0, pairs.height, size), feature_chunks(recs, pairs, size, tables)):
         x = matrix(f, stage.features)
+        if caps:
+            apply_feature_caps(x, stage.features, caps,
+                               None if cap_mask is None else cap_mask[s:s + len(x)])
         if store is not None:
             store[s:s + len(x)] = x
         out[s:s + len(x)] = stage.predict(x)
@@ -373,16 +395,27 @@ def stage3_scores(recs: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, sta
     return out
 
 
+def cap_mask_for(recs: pl.DataFrame, pairs: pl.DataFrame, countries: list) -> np.ndarray | None:
+    """Rows of `pairs` whose Source 1 record is in one of `countries` (None = all rows)."""
+    if not countries:
+        return None
+    country = recs["country_key"].to_numpy()[pairs["i"].to_numpy()]
+    return np.isin(country, list(countries))
+
+
 def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size: int, tables: dict,
-              variants: dict | None = None) -> dict:
+              variants: dict | None = None, caps: dict | None = None,
+              cap_countries: list | None = None) -> dict:
     """Probabilities through every stage: {"stage2": ..., "full": ..., <variant>: ...}
     ("full" is the last stage). Stage-1 features are kept in a disk-backed array so
-    stage 2 appends its context instead of recomputing them."""
+    stage 2 appends its context instead of recomputing them. `caps` clips feature
+    columns at predict time for the `cap_countries` (all countries when empty)."""
     n, first = pairs.height, stages[0]
+    mask = cap_mask_for(recs, pairs, cap_countries or []) if caps else None
     with tempfile.TemporaryDirectory(prefix="ber-features-") as tmp:
         store = np.lib.format.open_memmap(Path(tmp) / "stage1.npy", mode="w+", dtype=np.float32,
                                           shape=(n, len(first.features))) if len(stages) > 1 else None
-        prob = score_pairs(recs, pairs, first, size, tables, store)
+        prob = score_pairs(recs, pairs, first, size, tables, store, caps, mask)
         if len(stages) > 1:
             second = stages[1]
             if second.features[:len(first.features)] != first.features:
@@ -668,7 +701,12 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_di
     del raw
     t0 = time.time()
     tables = alignment.pool_tables(recs)
-    probs = score_all(recs, pairs, bundle.stages, bundle.config.feature_chunk, tables, bundle.variants) \
+    cfg = bundle.config
+    if cfg.feature_caps:
+        log.info("predict-time feature caps %s on countries %s", cfg.feature_caps,
+                 cfg.feature_cap_countries or "ALL")
+    probs = score_all(recs, pairs, bundle.stages, cfg.feature_chunk, tables, bundle.variants,
+                      cfg.feature_caps, cfg.feature_cap_countries) \
         if pairs.height else {"stage2": np.zeros(0), "full": np.zeros(0)}
     log.info("scored %d pairs with %d stage(s) in %.1fs (peak %.1f GB)", pairs.height, len(bundle.stages),
              time.time() - t0, peak_gb())

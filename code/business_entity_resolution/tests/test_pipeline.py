@@ -235,3 +235,30 @@ def test_per_country_stage3_choice(trained, tmp_path):
     prob = pipeline.select_probability(probs, bundle, country)
     india = country == "india"
     assert (prob[india] == probs["full"][india]).all() and (prob[~india] == probs["stage2"][~india]).all()
+
+
+def test_feature_caps_touch_only_named_columns_and_masked_rows():
+    import numpy as np
+    x = np.array([[3.0, 5.0], [2.0, 0.5], [9.0, 9.0]], dtype=np.float32)
+    pipeline.apply_feature_caps(x, ["amb_s23_addr_2", "other"], {"amb_s23_addr_2": 1.0},
+                                np.array([True, False, True]))
+    assert x.tolist() == [[1.0, 5.0], [2.0, 0.5], [1.0, 9.0]]
+    pipeline.apply_feature_caps(x, ["a", "b"], {"missing": 0.0}, None)  # unknown name: no-op
+    assert x.tolist() == [[1.0, 5.0], [2.0, 0.5], [1.0, 9.0]]
+
+
+def test_predict_with_cap_changes_only_capped_country(dataset, trained, tmp_path):
+    model_dir, out = trained
+    bundle = pipeline.Bundle.load(model_dir)
+    import dataclasses
+    bundle.config = dataclasses.replace(bundle.config, feature_caps={"amb_s23_addr_2": 0.0},
+                                        feature_cap_countries=["us"])
+    ids, matches, cands, _ = pipeline.predict(dataset, bundle, bundle_dir=tmp_path)
+    base = _read(out / "matching_results.tsv")
+    recs = pl.read_parquet(tmp_path / "test_scores" / "records.parquet").filter(pl.col("src") == 1)
+    got = matches.rename({"s1": "source1_entity_id", "id": "matched_entity_ids"})
+    for country, may_change in (("india", False), ("france", False)):
+        sub = recs.filter(pl.col("country_key") == country)["entity_id"]
+        a = base.filter(pl.col("source1_entity_id").is_in(sub.implode()))
+        b = got.filter(pl.col("source1_entity_id").is_in(sub.implode()))
+        assert a.equals(b) or may_change

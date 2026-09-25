@@ -157,6 +157,7 @@ def generate(recs: pl.DataFrame, k: int, k_rev: int, max_df: int) -> pl.DataFram
             t_matrix = time.time()
             nq = q_rows.height
             q, t = m[:nq], m[nq:]
+            n_keys = m.shape[1]
             del m
             schema = {"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32}
             r, c, v = search(q, t, k)
@@ -170,7 +171,7 @@ def generate(recs: pl.DataFrame, k: int, k_rev: int, max_df: int) -> pl.DataFram
             # exact and keeps the peak memory independent of the number of blocks.
             parts.append(pl.concat(block).group_by("i", "j").agg(pl.col("score").max()))
             log.info("blocking %s / source %d: %d + %d records, %d keys in vocabulary; keys %.0fs, "
-                     "matrix %.0fs, forward %.0fs, reverse %.0fs", country, s, nq, t_rows.height, q.shape[1],
+                     "matrix %.0fs, forward %.0fs, reverse %.0fs", country, s, nq, t_rows.height, n_keys,
                      t_keys - t0, t_matrix - t_keys, t_fwd - t_matrix, time.time() - t_fwd)
     if not parts:
         return pl.DataFrame(schema={"i": pl.UInt32, "j": pl.UInt32, "score": pl.Float32})

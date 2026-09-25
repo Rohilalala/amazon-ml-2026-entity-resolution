@@ -679,17 +679,24 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_di
             [pl.Series(f"prob_{k}", v.astype(np.float32)) for k, v in probs.items()]).write_parquet(
             scores_dir / "pairs.parquet")
         recs.select("row", "entity_id", "src", "country_key").write_parquet(scores_dir / "records.parquet")
+    pair_country = recs["country_key"].to_numpy()[pairs["i"].to_numpy()]
     return finish(recs.select("row", "entity_id", "src", "country_key"), pairs.select("i", "j"),
-                  select_probability(probs, bundle), bundle, prov)
+                  select_probability(probs, bundle, pair_country), bundle, prov)
 
 
-def select_probability(probs: dict, bundle: Bundle) -> np.ndarray:
-    """The probability column the bundle's configuration uses for the decision."""
-    choice = bundle.config.stage3_use
-    key = "stage2" if choice == "none" else choice
-    if key not in probs:
-        raise data.DataError(f"stage-3 choice {choice!r} not available; have {sorted(probs)}")
-    return probs[key]
+def select_probability(probs: dict, bundle: Bundle, pair_country: np.ndarray) -> np.ndarray:
+    """The probability each pair is decided on: the configured stage-3 choice, with
+    per-country overrides (stage3_by_country) applied by the Source 1 record's country."""
+    def column(choice):
+        key = "stage2" if choice == "none" else choice
+        if key not in probs:
+            raise data.DataError(f"stage-3 choice {choice!r} not available; have {sorted(probs)}")
+        return probs[key]
+    prob = column(bundle.config.stage3_use).copy()
+    for country, choice in bundle.config.stage3_by_country.items():
+        mask = pair_country == country
+        prob[mask] = column(choice)[mask]
+    return prob
 
 
 def load_scores(bundle_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame, dict]:

@@ -220,3 +220,18 @@ def test_decide_can_switch_stage3_variant(trained, tmp_path):
         assert cli.main(["decide", "--model", str(model_dir), "--out", str(tmp_path / choice),
                          "--stage3", choice]) == 0
         assert (tmp_path / choice / "matching_results.tsv").is_file()
+
+
+def test_per_country_stage3_choice(trained, tmp_path):
+    model_dir, _ = trained
+    out = tmp_path / "mixed"
+    assert cli.main(["decide", "--model", str(model_dir), "--out", str(out), "--stage3", "none",
+                     "--stage3-country", "india=full"]) == 0
+    records, pairs, probs = pipeline.load_scores(model_dir)
+    bundle = pipeline.Bundle.load(model_dir)
+    import dataclasses
+    bundle.config = dataclasses.replace(bundle.config, stage3_use="none", stage3_by_country={"india": "full"})
+    country = records["country_key"].to_numpy()[pairs["i"].to_numpy()]
+    prob = pipeline.select_probability(probs, bundle, country)
+    india = country == "india"
+    assert (prob[india] == probs["full"][india]).all() and (prob[~india] == probs["stage2"][~india]).all()

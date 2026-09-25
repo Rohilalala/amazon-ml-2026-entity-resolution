@@ -47,9 +47,18 @@ def _decide(args) -> None:
         bundle.config = dataclasses.replace(bundle.config, unseen_none_cap=args.unseen_none_cap)
     if args.stage3 is not None:
         bundle.config = dataclasses.replace(bundle.config, stage3_use=args.stage3)
+    if args.stage3_country:
+        overrides = dict(item.split("=", 1) for item in args.stage3_country)
+        bad = [v for v in overrides.values() if v not in pipeline.STAGE3_CHOICES]
+        if bad:
+            raise data.DataError(f"--stage3-country values must be one of {pipeline.STAGE3_CHOICES}, got {bad}")
+        bundle.config = dataclasses.replace(bundle.config, stage3_by_country=overrides)
     records, pairs, probs = pipeline.load_scores(args.model)
-    _, matches, cands, report = pipeline.finish(records, pairs, pipeline.select_probability(probs, bundle), bundle)
+    pair_country = records["country_key"].to_numpy()[pairs["i"].to_numpy()]
+    _, matches, cands, report = pipeline.finish(records, pairs, pipeline.select_probability(probs, bundle, pair_country),
+                                                bundle)
     report["stage3_use"] = bundle.config.stage3_use
+    report["stage3_by_country"] = bundle.config.stage3_by_country
     _write(args, matches, cands, report)
 
 
@@ -77,6 +86,8 @@ def main(argv=None) -> int:
                            help="override the unseen-country calibration cap (1 disables it)")
             p.add_argument("--stage3", choices=pipeline.STAGE3_CHOICES, default=None,
                            help="which probabilities decide: full, robust or none (stage 2)")
+            p.add_argument("--stage3-country", action="append", default=None, metavar="COUNTRY=CHOICE",
+                           help="per-country override, e.g. india=full (repeatable)")
         if name != "predict":
             d = Config()
             p.add_argument("--k", type=int, default=d.k, help="candidates per Source 1 record and source")

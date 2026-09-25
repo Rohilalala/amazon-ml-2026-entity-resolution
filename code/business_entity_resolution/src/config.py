@@ -53,8 +53,13 @@ class Config:
     # by at most this factor to match the seen countries' empty-prediction share.
     unseen_none_cap: float = 4.0
     # Which probabilities decide: "full" (stage 3), "robust" (stage 3 without the
-    # shared-deviation group features) or "none" (stage 2).
-    stage3_use: str = "full"
+    # shared-deviation group features) or "none" (stage 2), with per-country
+    # overrides. Stage 3 lets a candidate's likely siblings vouch for it. That helps
+    # where test data looks like training (India), but US test decoy businesses come
+    # as copy groups (18x the training rate) that vouch for each other, and France
+    # is unseen, so both are decided on stage 2.
+    stage3_use: str = "none"
+    stage3_by_country: dict = field(default_factory=lambda: {"india": "full"})
     lgb_params: dict = field(default_factory=_default_lgb_params)
     stage3_lgb_params: dict = field(default_factory=lambda: {"learning_rate": 0.05, "num_leaves": 63})
 

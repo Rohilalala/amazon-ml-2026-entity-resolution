@@ -4,6 +4,7 @@ Training produces a Bundle (fold models, feature list, decision rule, config,
 metrics, data fingerprints). Prediction only reads the Bundle, so the test run
 uses exactly the settings that were validated.
 """
+import gc
 import hashlib
 import inspect
 import json
@@ -150,13 +151,20 @@ def fold_ids(groups: np.ndarray, cfg: Config) -> np.ndarray:
 
 
 def cross_validate(X, y, folds, cfg: Config, stage: int = 1) -> tuple[np.ndarray, list[lgb.Booster]]:
-    """Out-of-fold probabilities over the given fold assignment."""
+    """Out-of-fold probabilities over the given fold assignment. The features are
+    binned once into one LightGBM dataset and every fold trains on a subset of it,
+    so no fold copies the feature matrix."""
     oof, boosters = np.zeros(len(y), dtype=np.float64), []
+    params = cfg.lgb(stage)
+    full = lgb.Dataset(X, y, params=params, free_raw_data=False).construct()
     for n in range(cfg.folds):
         tr, va = np.flatnonzero(folds != n), np.flatnonzero(folds == n)
         t0 = time.time()
-        b = fit(X[tr], y[tr], cfg, valid=(X[va], y[va]), stage=stage)
-        oof[va] = b.predict(X[va], num_iteration=b.best_iteration)
+        b = lgb.train(params, full.subset(tr), cfg.num_boost_round, valid_sets=[full.subset(va)],
+                      callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False)])
+        for s in range(0, len(va), cfg.feature_chunk):
+            rows = va[s:s + cfg.feature_chunk]
+            oof[rows] = b.predict(X[rows], num_iteration=b.best_iteration)
         boosters.append(b)
         log.info("fold %d/%d: %d rounds in %.0fs", n + 1, cfg.folds, b.best_iteration, time.time() - t0)
     return oof, boosters
@@ -464,6 +472,8 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     code_of = np.full(recs.height, -1, dtype=np.int64)
     code_of[sample["row"].to_numpy()] = np.arange(sample.height)
     in_sample = pairs["i"].is_in(sample["row"].implode()).to_numpy()
+    in_hold = pairs["i"].is_in(holdout["row"].implode()).to_numpy()
+    hp = pairs.filter(pl.Series(in_hold))  # holdout pairs, kept for the end of training
     tables = alignment.pool_tables(recs)
     ids = pairs.filter(pl.Series(in_sample)).select("i", "j", "y")
     X, names = build_matrix(recs, pairs.filter(pl.Series(in_sample)), cfg.feature_chunk, tables)
@@ -483,7 +493,6 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         transfer = _country_transfer(X, y, codes, n_true, country, cfg,
                                      max(1, int(np.mean([b.best_iteration for b in boosters]))))
 
-    full_ctx = None
     variants = {}
     oof_stage2 = oof_robust = None
     if cfg.stages > 1:
@@ -495,7 +504,11 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         p1[~in_sample] = score_pairs(recs, pairs.filter(pl.Series(~in_sample)), stages[0], cfg.feature_chunk, tables)
         full_ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", p1)))
         ctx = full_ctx.filter(pl.Series(in_sample)).drop("i", "j")
+        hold_ctx = full_ctx.filter(pl.Series(in_hold)).drop("i", "j")
         log.info("stage-1 context for %d pairs in %.0fs (peak %.1f GB)", pairs.height, time.time() - t0, peak_gb())
+        # Only the sample and holdout rows are needed from here on.
+        del full_ctx, p1, pairs
+        gc.collect()
         X = np.hstack([X, ctx.to_numpy().astype(np.float32)])
         names = names + ctx.columns
         del ctx
@@ -529,11 +542,9 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     log.info("out-of-fold macro F0.5 %.4f with rule %s; best trials %s", score, rule, trials)
     holdout_report = None
     if holdout.height:
-        in_hold = pairs["i"].is_in(holdout["row"].implode()).to_numpy()
-        hp = pairs.filter(pl.Series(in_hold))
         if len(stages) > 1:
-            h_prob = score_pairs(recs, pl.concat([hp, full_ctx.filter(pl.Series(in_hold)).drop("i", "j")],
-                                                 how="horizontal"), stages[1], cfg.feature_chunk, tables)
+            h_prob = score_pairs(recs, pl.concat([hp, hold_ctx], how="horizontal"), stages[1],
+                                 cfg.feature_chunk, tables)
         else:
             h_prob = score_pairs(recs, hp, stages[0], cfg.feature_chunk, tables)
         h_options = {"none": h_prob}

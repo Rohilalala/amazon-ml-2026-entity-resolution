@@ -58,17 +58,32 @@ def _first(df: pl.DataFrame, limit: int) -> pl.DataFrame:
             .filter(pl.col("i") < limit))
 
 
-def _keys_chunk(df: pl.DataFrame) -> pl.DataFrame:
-    """(row, h) blocking keys for one chunk of records (`row`, `core`, `addr`)."""
+def _address_words(df: pl.DataFrame) -> pl.DataFrame:
+    """(row, h): hashed skeletons of the non-numeric address words, in address order."""
+    words = _tokens(df, "addr").filter(~pl.col("t").str.contains(r"\d")).with_columns(skeleton(pl.col("t")).alias("k"))
+    return words.filter(pl.col("k").str.len_chars() >= 2).select("row", pl.col("k").hash(SEED["a"]).alias("h"))
+
+
+def word_frequencies(df: pl.DataFrame) -> pl.DataFrame:
+    """(h, wdf): in how many records of the block each address word occurs."""
+    return _address_words(df).unique().group_by("h").agg(pl.len().alias("wdf"))
+
+
+def _keys_chunk(df: pl.DataFrame, word_df: pl.DataFrame | None = None) -> pl.DataFrame:
+    """(row, h) blocking keys for one chunk of records (`row`, `core`, `addr`).
+    With `word_df`, each record keys on its rarest address words rather than its
+    first ones (long Indian addresses put the distinctive words last)."""
     name = _tokens(df, "core").with_columns(skeleton(pl.col("t")).alias("k"))
     name = _first(name.select("row", pl.when(pl.col("k") == "").then(pl.col("t")).otherwise(pl.col("k"))
                               .hash(SEED["n"]).alias("h")), MAX_NAME_TOKENS)
     addr = _tokens(df, "addr")
     nums = _first(addr.filter(pl.col("t").str.contains(r"\d"))
                   .select("row", pl.col("t").hash(SEED["d"]).alias("h")), MAX_NUMBERS)
-    words = addr.filter(~pl.col("t").str.contains(r"\d")).with_columns(skeleton(pl.col("t")).alias("k"))
-    words = _first(words.filter(pl.col("k").str.len_chars() >= 2)
-                   .select("row", pl.col("k").hash(SEED["a"]).alias("h")), MAX_ADDR_WORDS)
+    words = _address_words(df)
+    if word_df is not None:
+        words = (words.join(word_df, on="h", how="left", maintain_order="left")
+                 .with_columns(pl.col("wdf").fill_null(0)).sort("row", "wdf", maintain_order=True).drop("wdf"))
+    words = _first(words, MAX_ADDR_WORDS)
     concat = df.select("row", skeleton(pl.col("core").str.replace_all(" ", "")).hash(SEED["c"]).alias("h"))
 
     def pairs(a, b, seed, ordered=True, a_limit=None):
@@ -86,9 +101,11 @@ def _keys_chunk(df: pl.DataFrame) -> pl.DataFrame:
     return pl.concat([p.with_columns(pl.col("row").cast(pl.UInt32)) for p in parts]).unique()
 
 
-def record_keys(recs: pl.DataFrame) -> pl.DataFrame:
-    """(row, h) blocking keys of every record; `recs` needs `row`, `core`, `addr`."""
-    return pl.concat([_keys_chunk(recs.slice(s, KEY_CHUNK)) for s in range(0, recs.height, KEY_CHUNK)])
+def record_keys(recs: pl.DataFrame, rare_words: bool = True) -> pl.DataFrame:
+    """(row, h) blocking keys of every record; `recs` needs `row`, `core`, `addr`.
+    Address-word frequencies are counted over all of `recs` (one block)."""
+    word_df = word_frequencies(recs) if rare_words else None
+    return pl.concat([_keys_chunk(recs.slice(s, KEY_CHUNK), word_df) for s in range(0, recs.height, KEY_CHUNK)])
 
 
 def key_matrix(keys: pl.DataFrame, n_rows: int, max_df: int) -> sp.csr_matrix:

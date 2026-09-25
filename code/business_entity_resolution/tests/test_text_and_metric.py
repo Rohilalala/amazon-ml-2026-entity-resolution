@@ -14,7 +14,9 @@ def one(fn, value):
 @pytest.mark.parametrize("raw, expected", [
     ("Tata Consultancy Svcs Pvt. Ltd.", "tata consultancy services private limited"),
     ("Café Élysée SARL", "cafe elysee sarl"),
-    ("Joe's Pizza d/b/a Joe Slice", "joes pizza d b a joe slice"),
+    ("Joe's Pizza d/b/a Joe Slice", "joes pizza dba joe slice"),
+    ("Classe Fetes Groupe S.A.R.L.", "classe fetes groupe sarl"),
+    ("Cardiology Partners L.L.C.", "cardiology partners llc"),
     ("Smith & Sons Co.", "smith and sons company"),
     ("*** Sai Tech Private Limited", "sai technologies private limited"),
     ("", ""),
@@ -25,7 +27,7 @@ def test_clean_name(raw, expected):
 
 @pytest.mark.parametrize("raw, expected", [
     ("1427 14th Street, Omaha, NE", "1427 14 street omaha ne"),
-    ("S.F.S FLAT NO-1-59, NEW DELHI", "s f s flat no 159 new dl"),
+    ("S.F.S FLAT NO-1-59, NEW DELHI", "sfs flat no 159 new dl"),
     ("18220 68th St, Phoenix, Arizona", "18220 68 street phoenix az"),
     ("Sector-22D, Noida, Uttar Pradesh", "sector 22d noida up"),
     ("Ohio Texas West Virginia", "oh tx wv"),
@@ -33,6 +35,9 @@ def test_clean_name(raw, expected):
     ("None", ""),
     ("HOME CENTER, <NULL>, KOZHIKODE, N/A", "home center kozhikode"),
     ("5 Rue de l'Église, Lyon", "5 rue de leglise lyon"),
+    ("361 R. Du Clinquet, Tourcoing", "361 rue du clinquet tourcoing"),
+    ("12, M.G. Rd, Bengaluru", "12 mg road bengaluru"),
+    ("A-203, Dreamland", "a 203 dreamland"),
 ])
 def test_clean_address(raw, expected):
     assert one(text.clean_address, raw) == expected

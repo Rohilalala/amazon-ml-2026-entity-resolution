@@ -51,6 +51,9 @@ ADDR_ABBREV = {
     "hsg": "housing", "dist": "district", "distt": "district",
     "chem": "chemin", "imp": "impasse", "fbg": "faubourg", "fg": "faubourg",
     "mt": "mount", "ft": "fort", "pt": "point",
+    # French street types (France appears only in the test set).
+    "r": "rue", "all": "allee", "bld": "boulevard", "crs": "cours", "pass": "passage",
+    "qu": "quai", "sq": "square", "rpt": "rondpoint",
 }
 
 # State / union-territory names -> postal codes, so "Arizona" and "AZ" (or
@@ -105,7 +108,33 @@ def clean(s: pl.Series) -> pl.Series:
     # Glue digit runs split by noise ("1-59", "560 001" stay distinct, "22-d" -> "22d").
     s = s.str.replace_all(r"(\d)[-/.](\d)", "$1$2")
     s = s.str.replace_all(r"(\d)(st|nd|rd|th)\b", "$1")  # ordinals: 14th -> 14
-    return s.str.replace_all(r"[^a-z0-9]+", " ").str.strip_chars()
+    s = s.str.replace_all(r"[^a-z0-9]+", " ").str.strip_chars()
+    return _join_initials(s)
+
+
+def _glue(text: str) -> str:
+    out, run = [], []
+    for tok in text.split(" "):
+        if len(tok) == 1 and tok.isalpha():
+            run.append(tok)
+            continue
+        if run:
+            out.append("".join(run))
+            run = []
+        out.append(tok)
+    if run:
+        out.append("".join(run))
+    return " ".join(out)
+
+
+def _join_initials(s: pl.Series) -> pl.Series:
+    """Glue runs of single-letter tokens: 's a r l' -> 'sarl', 'l l c' -> 'llc',
+    'm g road' -> 'mg road', so dotted forms (S.A.R.L., M.G.) equal undotted ones.
+    A lone letter ('a 203') is left alone."""
+    idx = s.str.contains(r"(^| )[a-z] [a-z]( |$)").arg_true()
+    if len(idx) == 0:
+        return s
+    return s.scatter(idx, s.gather(idx).map_elements(_glue, return_dtype=pl.String))
 
 
 def expand(s: pl.Series, mapping: dict) -> pl.Series:

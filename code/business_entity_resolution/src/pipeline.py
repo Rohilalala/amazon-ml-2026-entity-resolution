@@ -295,7 +295,10 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     blocking = _blocking_report(pairs, n_true_all)
 
     # Sample Source 1 records for the matcher; their candidates come from the full pool.
-    sample = n_true_all.sample(min(cfg.train_s1_sample, n_true_all.height), seed=cfg.seed).sort("row")
+    shuffled = n_true_all.sample(fraction=1.0, shuffle=True, seed=cfg.seed)
+    sample = shuffled.head(min(cfg.train_s1_sample, n_true_all.height)).sort("row")
+    # Holdout: Source 1 records used by neither stage, scored exactly as the test set is.
+    holdout = shuffled.slice(sample.height, cfg.holdout_s1).sort("row")
     code_of = np.full(recs.height, -1, dtype=np.int64)
     code_of[sample["row"].to_numpy()] = np.arange(sample.height)
     in_sample = pairs["i"].is_in(sample["row"].implode()).to_numpy()
@@ -323,8 +326,8 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         p1 = np.empty(pairs.height, dtype=np.float32)
         p1[in_sample] = oof
         p1[~in_sample] = score_pairs(recs, pairs.filter(pl.Series(~in_sample)), stages[0], cfg.feature_chunk)
-        ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", p1)))
-        ctx = ctx.filter(pl.Series(in_sample)).drop("i", "j")
+        full_ctx = features.probability_context(pairs.select("i", "j").with_columns(pl.Series("p1", p1)))
+        ctx = full_ctx.filter(pl.Series(in_sample)).drop("i", "j")
         log.info("stage-1 context for %d pairs in %.0fs (peak %.1f GB)", pairs.height, time.time() - t0, peak_gb())
         del X
         table = pl.concat([table, ctx], how="horizontal")
@@ -335,6 +338,18 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
 
     score, rule, trials = choose_rule(codes, n_true, oof, y)
     log.info("out-of-fold macro F0.5 %.4f with rule %s; best trials %s", score, rule, trials)
+    holdout_report = None
+    if holdout.height:
+        in_hold = pairs["i"].is_in(holdout["row"].implode()).to_numpy()
+        hp = pairs.filter(pl.Series(in_hold))
+        if len(stages) > 1:
+            hp = pl.concat([hp, full_ctx.filter(pl.Series(in_hold)).drop("i", "j")], how="horizontal")
+        h_prob = score_pairs(recs, hp, stages[-1], cfg.feature_chunk)
+        holdout_report = _holdout_report(hp, h_prob, holdout, rule)
+        if len(stages) > 1:
+            holdout_report["stage1"] = _holdout_report(hp, p1[in_hold], holdout, choose_rule(
+                codes, n_true, p1[in_sample], y)[1])["f05"]
+        log.info("HOLDOUT (never trained on, scored like the test set): %s", holdout_report)
     keep = apply_rule(rule, codes, oof)
     by_country = {}
     for c in np.unique(country):
@@ -358,11 +373,31 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     }
     if country_check:
         report["unseen_country_stage1"] = transfer
+    report["holdout"] = holdout_report
     report["train_seconds"] = round(time.time() - t_start, 1)
     bundle = Bundle(cfg, stages, rule, report)
     bundle.oof = table.select("i", "j", "y").with_columns(
         pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes))
     return bundle
+
+
+def _holdout_report(pairs: pl.DataFrame, prob: np.ndarray, holdout: pl.DataFrame, rule: dict) -> dict:
+    """Macro F0.5 on holdout Source 1 records (all of them, including those with
+    no candidates), overall and per country."""
+    code_of = pl.DataFrame({"i": holdout["row"], "code": np.arange(holdout.height)})
+    codes = pairs.select("i").join(code_of, on="i", how="left", maintain_order="left")["code"].to_numpy()
+    keep = apply_rule(rule, codes, prob)
+    y = pairs["y"].to_numpy()
+    n_true = holdout["n_true"].to_numpy()
+    out = {"s1": holdout.height, "f05": round(macro_f05(codes, n_true, keep, y), 5), "by_country": {}}
+    country = holdout["country_key"].to_numpy()
+    for c in np.unique(country):
+        ent = np.flatnonzero(country == c)
+        remap = np.full(holdout.height, -1)
+        remap[ent] = np.arange(len(ent))
+        m = np.isin(codes, ent)
+        out["by_country"][str(c)] = round(macro_f05(remap[codes[m]], n_true[ent], keep[m], y[m]), 5)
+    return out
 
 
 def _blocking_report(pairs: pl.DataFrame, n_true: pl.DataFrame) -> dict:

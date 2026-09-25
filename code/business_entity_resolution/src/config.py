@@ -34,6 +34,9 @@ class Config:
     # Training: Source 1 records sampled for the matcher (their candidates
     # come from the full pool), cross-validation folds, feature chunk size.
     train_s1_sample: int = 400_000
+    # Source 1 records kept out of both stages and scored exactly like the test
+    # set: an unbiased estimate of the leaderboard (per country).
+    holdout_s1: int = 100_000
     folds: int = 5
     feature_chunk: int = 1_000_000
     seed: int = 42

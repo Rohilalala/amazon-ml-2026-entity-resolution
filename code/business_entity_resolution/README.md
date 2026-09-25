@@ -51,15 +51,24 @@ python3 utils/validate_submission.py --matching output/matching_results.tsv \
 | Stage | Module | What it does |
 |---|---|---|
 | Load | `src/data.py` | Reads TSVs as text (quote characters are data), checks columns, id prefixes, duplicates and ground-truth references |
-| Normalise | `src/text.py` | Transliterates Indic scripts to ASCII, removes accents and placeholders (`<NULL>`, `N/A`), `&`→`and`, expands abbreviations (Pvt/Ltd/Corp, Rd/St), maps state names to codes, builds a core name without legal forms and a phonetic skeleton of every token |
-| Block | `src/candidates.py` | Per country and source: records become sparse vectors of rare *keys* (skeleton tokens, name-token pairs, number × name, number × street word, name × address word, whole name without spaces). Top-k Source 2/3 records per Source 1 record by IDF-weighted cosine, plus a reverse top-k from Source 2/3 to Source 1 |
-| Features | `src/features.py` | ~45 country-agnostic pair features: fuzzy name/address scores, skeleton similarity, token/number Jaccard, house-number agreement, acronyms, script flags, and how the pair ranks against competing candidates on both sides |
-| Model | `src/pipeline.py` | LightGBM, cross-validated with folds grouped by Source 1 record; the test prediction is the mean of the fold models |
-| Decide | `src/pipeline.py` | Each Source 2/3 record goes to its most likely Source 1 record only; then either a global threshold or a per-record expected-F0.5 selection, whichever scores higher on out-of-fold predictions |
+| Normalise | `src/text.py`, `src/indic.py` | Indic words translated with a dictionary learned from training pairs, then ASCII transliteration; placeholders removed, `&`→`and`, single letters joined (S.A.R.L.→sarl), abbreviations expanded, state names to codes, core name without legal forms, phonetic skeletons |
+| Locale | `src/locale_norm.py` | Label-free: address words that are strongly asymmetric between Source 1 and Source 2/3 within a country (France's region/department phrases) are dropped on both sides |
+| Block | `src/candidates.py` | Per country and source: records become sparse vectors of rare keys (skeleton tokens and pairs, transliteration-aware variants, name prefix/suffix, numbers, rarest address words and their pairs, cross keys). Top-10 by IDF cosine per source, plus reverse top-3 |
+| Features | `src/features.py`, `src/alignment.py` | 78 pair features: fuzzy scores, token and number alignment with corpus frequency, ambiguity counts, character similarity, house-number agreement, retrieval context on both sides |
+| Model | `src/pipeline.py`, `src/groupfeat.py` | Three LightGBM stages cross-validated with folds grouped by Source 1 record: pair features; + stage-1 competition context; + group features comparing each candidate with the likely members of its group. Test prediction = mean of the fold models |
+| Decide | `src/pipeline.py` | Exclusive owner rule, then per-record expected-F0.5 selection; stage-3 or stage-2 probabilities chosen per country (`stage3_use`, `stage3_by_country`); unseen countries calibrated to the seen countries' empty-prediction share |
 | Write | `src/data.py` | Enforces every submission rule, then writes atomically |
 
 Settings live in `src/config.py`; the CLI overrides `--k`, `--k-rev`,
 `--max-df`, `--sample`, `--folds` and `--seed`.
+
+Other commands:
+
+```bash
+.venv/bin/python -m src.cli block  --data DATA --cache CACHE          # blocking recall on train only
+.venv/bin/python -m src.cli decide --model artifacts/model --out OUT \
+    --stage3 none --stage3-country india=full                         # re-decide from saved test scores
+```
 
 ## What training reports
 

@@ -1,22 +1,33 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
+**Team Name:** MEOW MEOW  
+**Team Members:** Aditya Rohilla, [second team member]  
 **Submission Date:** 25 September 2026
 
 ---
 
 ## 1. Executive Summary
 
-A three-step pipeline: rare-key retrieval blocking, a two-stage LightGBM
-pair classifier, and a per-record decision rule that maximises expected
-F0.5. Blocking recovers 97.0% of true pairs at 25 candidates per Source 1
-record. The matcher reaches a macro F0.5 of 0.974 on out-of-fold validation,
-against a blocking ceiling of 0.990. The main ideas are blocking on
-*combinations* of tokens (single words are shared by thousands of
-businesses), a phonetic skeleton that bridges Indic-script transliterations
-and English spellings, and a second stage that sees how each pair's
-probability compares with its competitors.
+A retrieve-then-rank pipeline:
+
+1. IDF-weighted retrieval over rare token *combinations* for blocking.
+2. A three-stage LightGBM matcher.
+3. A per-record rule that maximises expected F0.5.
+
+Blocking finds 98.7% of true pairs at 25 candidates per Source 1 record, a
+perfect-matcher ceiling of 0.996. On 100k Source 1 records held out from all
+training and scored exactly like the test set, the matcher reaches a macro
+F0.5 of **0.9873**.
+
+The main contributions are:
+
+- Phonetic skeletons plus an Indic-to-English word dictionary learned from the
+  training pairs, so that transliterated names line up with their English
+  forms.
+- Token-alignment and ambiguity features that separate decoy businesses from
+  noisy true copies.
+- Label-free adaptation for the unseen country (France) and for the test
+  set's denser decoys.
 
 ---
 
@@ -24,163 +35,251 @@ probability compares with its competitors.
 
 ### 2.1 Problem Analysis
 
-Findings from the full training set (2.2M Source 1, 5.0M Source 2, 5.3M
-Source 3 records):
+Findings from the full training set (2.2M Source 1, 5.0M Source 2, 5.3M Source 3 records):
 
-- **Structure.** No Source 2/3 record is matched to more than one Source 1
-  record, and no true match crosses countries. 5.6% of Source 1 records are
-  singletons; the rest have 1–11 matches (mostly 3–4), split across Source 2
-  and Source 3. 26% of Source 2/3 records match nothing (decoys).
-- **Names** come from a limited vocabulary, so single words ("Quality",
-  "Prime", "Global") are shared by tens of thousands of businesses. Noise:
-  typos, abbreviations (Pvt, Ltd, Corp), legal-suffix changes, swapped word
-  order, appended words ("Center", "Services"), prefixes (M/s, Shri, `***`,
-  `--`), "formerly X", and website-style names (`qualityaceculture.com`).
-- **Scripts.** About 10% of Indian Source 2/3 names are in Devanagari,
-  Malayalam, Kannada or Bengali script, and some addresses contain state
-  names in Devanagari (उत्तर प्रदेश).
-- **Addresses:** reordered components, abbreviations (Rd/St/Cir), state
-  name vs code (Arizona/AZ, Uttar Pradesh/UP, Kerala/Keralam), placeholders
-  (`<NULL>`, `N/A`, `None`), extra prefixes (H.no, Plot, Door No), PO boxes,
-  and 12% of candidate records with no usable address at all.
-- **Decoys** copy a real business's name and street with a nearby house
-  number (228 vs 249, 6654 vs 665). These were the largest source of wrong
-  merges before house-number features were added.
-- **Test set:** 1.73M Source 1 records, 15% of them in France, which never
-  appears in training.
+- **Structure:**
+  - No Source 2/3 record matches more than one Source 1 record, and no true
+    match crosses countries.
+  - 5.6% of Source 1 records are singletons; the rest have 1–11 matches
+    (mostly 3–4), split across Source 2 and Source 3.
+  - 26% of Source 2/3 records match nothing. These are decoys: near-copies of
+    a real business with a changed house number or name word.
+- **Names** come from a small vocabulary, so single words ("Quality", "Prime")
+  are shared by tens of thousands of businesses. Noise seen:
+  - typos, abbreviations (Pvt/Ltd/Corp) and dotted forms (S.A.R.L., L.L.C.)
+  - legal-suffix changes, swapped word order, appended words ("Center")
+  - prefixes (M/s, Shri, `***`), "formerly X"
+  - website-style names (`qualityaceculture.com`)
+- **Scripts:** 23% of India Source 2 names and 13% of India Source 3 names are
+  in Devanagari, Bengali, Kannada, Malayalam or other Indic scripts. Some
+  addresses carry state names in Devanagari. Before the dictionary below,
+  these pairs caused 41% of India's blocking misses.
+- **Addresses:**
+  - reordered components and abbreviations (Rd/St/Cir)
+  - state name vs code (Arizona/AZ, Uttar Pradesh/UP, Kerala/Keralam)
+  - placeholders (`<NULL>`, `N/A`, `None`) and extra prefixes (H.no, Plot, Door No)
+  - no usable address in about 4% of true pairs; these are the hardest remaining cases
+- **Test set:**
+  - 1.73M Source 1 records, 15% in France, which never appears in training.
+  - France Source 1 addresses always end in a long region phrase ("…, Bordeaux,
+    Nouvelle-Aquitaine"). France Source 2/3 records carry the region, a
+    department ("Gironde") or neither.
+  - 40% of test Source 2/3 records are unowned, against 26% in training. In
+    the US these decoys often come as small groups of copies sharing a nearby
+    house number.
 
 ### 2.2 Solution Strategy
 
-**Approach Type:** Blocking + two-stage classifier + expected-F0.5 decision rule  
-**Core Innovation:** IDF-weighted retrieval over rare *combination* keys
-built from phonetic skeletons, plus a second-stage model on competition
-features (how a pair ranks against the other candidates on both sides).
+**Approach Type:** Blocking + three-stage LightGBM classifier + expected-F0.5 decision rule.
 
-Only the provided data is used. There are no external lookups, geocoding or
-APIs. The model is LightGBM (MIT licence). Country is used only to restrict
-the search and is never a model feature, so the model applies unchanged to
-France.
+**Core Innovation:**
+
+- Rare-combination key retrieval built on phonetic skeletons and a learned
+  transliteration dictionary.
+- Pair features that align leftover tokens and numbers and count
+  name/address ambiguity in the pool.
+- Label-free test-time adaptation: locale normalisation, empty-share
+  calibration, and a per-country choice of the group-feature stage.
+
+Only the provided data is used: no external databases, geocoding or APIs. The
+dictionary and locale rules are learned from the provided files. All models
+are LightGBM (MIT licence). Country restricts the search and selects
+data-driven normalisation, but it is never a model feature.
 
 ---
 
 ## 3. Candidate Generation (Blocking)
 
-**Normalisation.** Non-Latin scripts are transliterated to ASCII (anyascii),
-accents and placeholders are removed, `&` becomes "and", digit runs split by
-noise are re-joined ("1-59" → "159"), ordinals are dropped ("14th" → "14"),
-state names are mapped to codes, and abbreviations are expanded. A *core
-name* drops legal forms and honorifics. Every token gets a phonetic
-**skeleton**: c/q→k, z→s, w→v, ph→f, then h and vowels are dropped and
-repeated consonants collapsed. The skeleton equates transliterations with
-English spellings ("helthkeyr"/"healthcare" → "ltkr", "praivet"/"private" →
-"prvt").
+**Normalisation:**
+
+- Indic words are first translated with a dictionary learned from training
+  pairs. Indic-script Source 2/3 names are word-by-word transliterations of
+  their Source 1 name, so aligning the words in order over 551k pairs gives
+  1,362 entries such as अर्बन→urban. Indic address runs map to the state
+  voted by the matched Source 1 address.
+- Remaining non-Latin text is transliterated to ASCII.
+- Accents and placeholders are removed, `&` becomes "and", split digit runs
+  are re-joined ("1-59"→"159") and ordinals dropped ("14th"→"14").
+- Runs of single letters are joined ("s a r l"→"sarl"), state names map to
+  codes, and abbreviations are expanded.
+- A *core name* drops legal forms and honorifics, also matched by skeleton,
+  so transliterated "praivet" is dropped like "private".
+- Each token gets a phonetic **skeleton**: c/q→k, z→s, w→v, ph→f, then h and
+  vowels are dropped and repeated consonants collapsed. A second,
+  transliteration-aware skeleton also merges soft c/g, b/v, m/n, j/s and d/t.
+
+**Locale normalisation (label-free).** For every country we compare how often
+each address word appears in Source 1 against Source 2/3. Words that are
+strongly source-asymmetric are dropped from that country's addresses on both
+sides, together with the articles joining them. On the test set this finds
+exactly France's region and department words and the "N°" markers. On the
+US/India training data it finds nothing, so the trained models see unchanged
+inputs.
 
 **Blocking keys used**, each hashed to 64 bits:
 
-| Key | Example |
+| Key family | Example |
 |---|---|
-| core-name token skeleton | `trstd` |
-| unordered pair of core-name tokens | `trstd|sftvr` |
-| address number | `18220` |
-| address word skeleton | `sprs` |
-| number × name token | `18220|trstd` |
-| number × address word | `1731|sprs` |
-| name token × address word | `trstd|fnks` |
-| whole core name without spaces | matches `trustedsoftware.com` |
+| core-name token skeleton, and its transliteration-aware variant | `trstd` |
+| unordered pair of core-name tokens (both skeletons) | `trstd\|sftvr` |
+| whole core name without spaces (both skeletons), plus its first/last 6 letters | matches `trustedsoftware.com` |
+| address number (leading zeros removed, glued ranges split) | `18220` |
+| address word skeleton: the record's 5 *rarest* words, not its first 5 | `sprs` |
+| unordered pair of address words | `sprs\|ln` |
+| number × name token, number × address word, name token × address word | `18220\|trstd` |
 
-Keys are weighted by IDF within the country. Keys seen once, or more than
-1,000 times, are dropped. Each record becomes an L2-normalised sparse vector.
-For every Source 1 record we keep the top 10 Source 2 and top 10 Source 3
-records by cosine, using chunked sparse matrix products run in parallel
-threads. A reverse pass adds the top 3 Source 1 records for every Source 2/3
-record. Search stays within one country.
+Before key building, digit look-alikes inside name words are mapped back to
+letters ("pi1ates"→"pilates").
 
-- **Candidate pairs generated:** 55.5M on train (25.2 per Source 1 record);
-  47.1M on test (27.2 per Source 1 record).
-- **How true matches were kept:** combination keys stay rare even when their
-  parts are common; the skeleton absorbs spelling, transliteration and typo
-  noise; several independent key families (name-only, address-only, mixed)
-  mean a record still matches when one field is corrupted or missing; and
-  the reverse pass rescues pairs that rank low from the Source 1 side.
-  Measured on the full training set: **pair recall 0.970** (US 0.980, India
-  0.955), and an **F0.5 ceiling of 0.990** for a perfect matcher on these
-  candidates.
+**Search:**
+
+- Keys are weighted by IDF within each country and source block. Keys seen
+  once, or more than 3,000 times, are dropped.
+- Each record becomes an L2-normalised sparse vector.
+- For every Source 1 record we keep the top 10 Source 2 and top 10 Source 3
+  records by cosine, using chunked sparse matrix products in parallel threads.
+- A reverse pass adds the top 3 Source 1 records for every Source 2/3 record.
+- Search never crosses countries.
+
+- **Candidate pairs generated:** 55.8M on train (25.3 per Source 1 record);
+  47.2M on test (27.3 per Source 1 record).
+- **How true matches were kept:**
+  - Combination keys stay rare even when their parts are common.
+  - Skeletons and the learned dictionary absorb spelling, transliteration and
+    typo noise.
+  - Independent key families (name-only, address-only, mixed) keep a record
+    findable when one field is corrupted or empty.
+  - The reverse pass rescues pairs ranked low from the Source 1 side.
+
+  Measured on the full training set: **pair recall 0.9867** (US 0.9906, India
+  0.9808); **F0.5 ceiling 0.9960**.
 
 ---
 
 ## 4. Matching Model
 
-**Features used** (43 in stage 1, 52 in stage 2):
+**Features used:** 78 in stage 1, 87 in stage 2, 47 in stage 3.
 
-- **Name features:** rapidfuzz ratio, partial ratio, token-sort and
-  token-set ratios, and Jaro-Winkler on the normalised name and on the core
-  name; ratio and token-set on the skeletons; similarity of the space-free
-  names (website names); acronym match; core-token Jaccard; name lengths.
-- **Address features:** ratio, partial, token-sort and token-set ratios;
-  address-word Jaccard; number Jaccard and shared-number count; house-number
-  equality, equality after stripping leading zeros, edit-distance similarity,
-  log absolute difference, and containment (665 inside 6654); address
-  lengths and number counts.
-- **Other:** retrieval cosine; rank and gap to the best candidate among the
-  Source 1 record's candidates (overall and per source) and among the Source 1
-  records competing for the same Source 2/3 record; candidate counts on both
-  sides; source flag; non-Latin script flags for name and address.
-- **Stage-2 features:** the stage-1 probability, its rank and gap on both
-  sides, the probability sum per Source 1 record and per Source 2/3 record,
-  the count of candidates above 0.5, and the margin over the runner-up owner
-  of the Source 2/3 record.
+- **Name features:**
+  - rapidfuzz ratio, partial, token-sort and token-set ratios, and
+    Jaro-Winkler, on the name and the core name
+  - skeleton similarity, space-free name similarity (website names),
+    acronym match
+  - letter-bag cosine and character-trigram TF-IDF cosine
+- **Token alignment** (names and addresses separately):
+  - After exact matches are removed, the number of leftover tokens on each side.
+  - The best edit similarity of each leftover to the other side's leftovers:
+    a typo scores high, a substituted word low.
+  - The leftovers' corpus frequency and a "common word substituted" flag.
+  - These separate decoys ("Emerald Financial" vs "Emerald Industries") from
+    noisy true copies.
+- **Address features:**
+  - fuzzy ratios and address-word Jaccard
+  - number alignment over all address numbers: coverage, smallest numeric gap,
+    smallest edit distance, prefix relation
+  - house-number equality, equality after removing zeros, edit similarity,
+    log numeric gap and containment (665 inside 6654)
+- **Ambiguity:** how many Source 1 and Source 2/3 records in the pool share
+  this core name, skeleton or address. Name-only evidence is weak when six
+  businesses carry the name.
+- **Context:**
+  - the retrieval cosine
+  - rank and gap to the best candidate among the Source 1 record's candidates,
+    and among the Source 1 records competing for the same Source 2/3 record
+  - candidate counts; source and script flags
+- **Stage 2** adds the stage-1 probability and how it compares with rivals on
+  both sides: rank, gap, sums, and the margin over the runner-up owner of the
+  Source 2/3 record.
+- **Stage 3** compares a candidate with the other likely members of its
+  Source 1 record's group. It uses the probability-weighted similarity of
+  name, address and house number to the anchors, agreement across sources,
+  and whether the candidate's deviations from Source 1 are shared by the
+  anchors.
 
-**Model type:** LightGBM gradient-boosted trees (binary log-loss, 127
-leaves, learning rate 0.08, early stopping). Stage 1 is trained on 300k
-sampled Source 1 records, whose candidates come from the full pool, with
-4-fold cross-validation grouped by Source 1 record. Stage-1 probabilities for
-all 55.5M training pairs (out-of-fold for sampled records, fold-model average
-for the rest) feed the stage-2 features. Stage 2 is trained the same way.
-Test predictions are the mean of the fold models.
+**Model type:** LightGBM gradient-boosted trees, with binary log-loss and early stopping.
 
-**Threshold selection method:** each Source 2/3 record is first assigned to
-its most likely Source 1 record only, as in the ground truth. Then two rules
-are scored on out-of-fold predictions with the exact macro F0.5 metric,
-singletons included: a global probability threshold (0.05–0.95), and a
-per-record rule that keeps the top-k candidates maximising expected F0.5,
-E[F] ≈ 1.25·Σᵢ≤ₖ pᵢ / (0.25·Σp + k), with "keep nothing" chosen when
-Π(1 − p) is larger. The expected-F0.5 rule scored best and is used.
+- Stages 1–2: 127 leaves, learning rate 0.08.
+- Stage 3: 63 leaves, learning rate 0.05, trained on pairs with stage-2
+  probability ≥ 0.001.
+- Training uses 500k sampled Source 1 records; their candidates come from the
+  full pool.
+- 4-fold cross-validation, grouped by Source 1 record, with one fold
+  assignment shared by all stages.
+- Stage-1 probabilities for all 55.8M training pairs (out-of-fold for the
+  sample, fold-model average otherwise) feed stage 2.
+- Test predictions are the mean of the fold models.
+
+**Stage-3 choice by country:**
+
+- Stage 3 adds +0.0007 on the holdout, but it lets siblings vouch for each
+  other.
+- On the test set, US decoy businesses arrive as copy groups sharing a nearby
+  house number: all-unowned twin groups are 18 times the training rate. There,
+  stage 3 adds 0.07 extra house-variant matches per record over stage 2, which
+  are very likely decoys.
+- India's test profile matches training, so India is decided on stage 3. The
+  US and the unseen France are decided on stage 2.
+
+**Threshold selection method:**
+
+- Each Source 2/3 record is first given to its most likely Source 1 record
+  only, as in the ground truth.
+- A per-record rule keeps the top-k candidates maximising expected F0.5,
+  E[F] ≈ 1.25·Σᵢ≤ₖ pᵢ / (0.25·Σp + k), and keeps nothing when Π(1 − p) is
+  larger.
+- It was chosen over 91 global thresholds on out-of-fold predictions with the
+  exact metric, singletons included.
+- For France only, the "keep nothing" term is raised (at most 4×) until
+  France's share of empty predictions matches the seen countries in the same
+  run (5.2%→5.6%). This uses no labels.
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** 0.9739 out-of-fold (US 0.979, India 0.966), with
-  a blocking ceiling of 0.990.
+- **F_0.5 Score (macro):**
+  - Honest holdout (100k Source 1 records used by no stage, scored like the
+    test set): **0.9873** (India 0.9866, US 0.9878).
+  - Out-of-fold by stage: 0.9846 / 0.9861 / 0.9869.
+  - Blocking ceiling: 0.9960.
 
-| Version | Change | OOF F0.5 |
+| Version | Change | Holdout / OOF F0.5 |
 |---|---|---|
-| v1 | 1 stage, 100k training records | 0.960 |
-| v2 | 2 stages, 300k training records | 0.969 |
-| v3 | + house-number similarity features | 0.974 |
+| v1 | 1 stage, 100k records | 0.960 (OOF) |
+| v2 | 2 stages, 300k records | 0.969 (OOF) |
+| v3 | house-number similarity features | 0.974 (OOF), 0.975 (holdout) |
+| v5 | Indic dictionary, rarest-word keys, token-alignment and ambiguity features, stage 3, 500k records | 0.9851 (holdout) |
+| v7 | transliteration-aware and address-pair keys, locale normalisation, per-country stage-3 choice | 0.9873 (holdout) |
 
-- **Unseen-country estimate (stage 1, v2):** trained on India and scored on
-  US: 0.944 (in-country 0.966). Trained on US and scored on India: 0.864.
-  France, being Latin-script, should behave like the milder case.
-- **Common false positives (wrong merges):** decoys with the same name and
-  street but a different house number (reduced by the house-number
-  features), and names with an appended word ("Moore Holdings Holdings").
-  Precision on the sample is 0.992.
-- **Common false negatives (missed matches):** candidates with an empty
-  address, where only a common name is left (37% of in-candidate misses);
-  heavily typo'd names; Bengali or Kannada transliterations whose skeletons
-  drift from the English spelling; and true pairs never retrieved by blocking
-  (3%).
+- **Common false positives (wrong merges):**
+  - decoys with the same name and street but a nearby house number
+  - the same business name at another branch
+  - singletons matched to a decoy (1.6% of singletons)
+  - Precision on the out-of-fold sample is above 0.99.
+- **Common false negatives (missed matches):**
+  - Candidates with an empty address whose name is shared by several Source 1
+    records (chains). The model is calibrated there and the text cannot say
+    which branch owns the record.
+  - Names replaced by an unrelated word with the same address.
+  - Heavily typo'd names.
+  - True pairs never retrieved (1.3%).
 
 ---
 
 ## 6. Conclusion
 
 Treating blocking as weighted retrieval over rare token combinations made
-the problem tractable at 12.5M records on one laptop without losing recall.
-A two-stage matcher that reasons about competing candidates, plus a decision
-rule aligned with the metric, gave most of the precision. The largest single
-gain came from error analysis: decoys that differ only in the house number.
+12.5M records tractable on one laptop at 98.7% recall. Most of the remaining
+gain came from error analysis:
+
+- decoys differing only in a house number
+- transliterated names
+- substituted name words
+
+On the test side, two shifts could only be seen by comparing test statistics
+with training: an unseen address format, and decoys arriving in copy groups.
+Label-free checks of those statistics decided how the model is applied per
+country.
 
 ---
 
@@ -192,15 +291,18 @@ gain came from error analysis: decoys that differ only in the house number.
 
 | Path | Role |
 |---|---|
-| `src/cli.py` | Entry point: `train`, `predict`, `run` |
+| `src/cli.py` | Entry point: `run` (train + predict), `train`, `predict`, `block` (blocking recall only), `decide` (re-apply the decision rule to saved scores) |
 | `src/data.py` | TSV loading with schema checks; submission-rule checks; atomic writes |
 | `src/text.py` | Normalisation, transliteration, state codes, skeletons |
+| `src/indic.py` | Indic-to-English word dictionary learned from training pairs |
+| `src/locale_norm.py` | Label-free source-asymmetric address-word removal |
 | `src/candidates.py` | Key generation and parallel sparse retrieval |
-| `src/features.py` | Record preparation, pair and competition features |
-| `src/pipeline.py` | Training (cross-validation, two stages, rule selection), prediction, model bundle |
+| `src/features.py`, `src/alignment.py` | Record preparation; pair, alignment, ambiguity and competition features |
+| `src/groupfeat.py` | Stage-3 group features |
+| `src/pipeline.py` | Training (grouped cross-validation, three stages, rule selection, honest holdout), prediction, decision, model bundle |
 | `src/metric.py` | Macro F0.5, reference and vectorised forms |
 | `src/config.py` | All settings; saved inside the model bundle |
-| `tests/` | 36 tests, including a synthetic end-to-end run checked by the challenge validator |
+| `tests/` | 46 tests, including synthetic end-to-end runs checked with the challenge validator |
 
 To reproduce both output files:
 
@@ -208,16 +310,27 @@ To reproduce both output files:
 cd code/business_entity_resolution
 python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m src.cli run --data <dataset dir> --model artifacts/model \
-    --out ../../output --sample 300000 --folds 4
+    --out ../../output --sample 500000 --folds 4
 ```
 
-Runtime on a 24 GB, CPU-only laptop is about 2.5 hours for training and
-test prediction, with peak memory about 11 GB.
+On a 24 GB, CPU-only laptop, blocking takes about 50 minutes per split,
+training about 1 hour and test scoring about 50 minutes. Peak memory is under
+21 GB. Pass `--cache DIR` to reuse the candidate tables between runs.
 
 ### B. Additional Results
 
-- Blocking per country (train): US recall 0.980, ceiling 0.994; India recall
-  0.955, ceiling 0.984.
-- Test predictions (v3): US 94.3%, India 94.0% and France 95.4% of Source 1
-  records receive at least one match; average matches per matched record are
-  3.4–3.6, consistent with the 3.7 seen in training.
+- **Blocking per country (train):** US recall 0.9906, ceiling 0.9973; India
+  recall 0.9808, ceiling 0.9941.
+- **Leave-one-country-out (stage 1, earlier version):** trained on India and
+  scored on US 0.944; trained on US and scored on India 0.864.
+- **Test predictions:**
+  - Share of Source 1 records with at least one match: US 94.4%, India 94.1%,
+    France 94.4%.
+  - Matches per matched record: 3.5–3.6, consistent with the 3.46 true
+    matches per Source 1 record in training.
+- **Measured and not adopted:**
+  - exact F-measure maximisers and dependent-label rules (±0.00003)
+  - label-shift prior correction (EM, BBSE): negative on an unseen country
+  - transitive or twin propagation over Source 2/3 (−0.006 to −0.018)
+  - bipartite assignment (the one-sided form equals our owner rule)
+  - a larger candidate count alone (+0.0003, not significant)

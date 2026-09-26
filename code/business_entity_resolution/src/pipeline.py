@@ -24,7 +24,7 @@ import numpy as np
 import polars as pl
 from sklearn.model_selection import GroupKFold
 
-from . import alignment, candidates, data, features, groupfeat, indic, locale_norm, text
+from . import alignment, candidates, data, features, groupfeat, indic, locale_norm, text, unseen_rules
 from .config import Config
 from .metric import f05_counts
 
@@ -48,6 +48,8 @@ def robust_stage3_features(names: list[str]) -> list[str]:
 
 
 STAGE3_CHOICES = ("full", "robust", "none")
+# Record columns saved with the test scores: ids, country and what unseen_rules reads.
+RECORD_COLUMNS = ("row", "entity_id", "src", "country_key", *unseen_rules.COLUMNS)
 
 
 # ---------------------------------------------------------------- stages
@@ -254,7 +256,8 @@ def decide(i: np.ndarray, j: np.ndarray, prob: np.ndarray, pair_country: np.ndar
     if rule["kind"] != "expected_f05" or not unseen or cfg.unseen_none_cap <= 1 or not seen:
         return keep, info
     share = {c: _empty_share(i[pair_country == c], keep[pair_country == c], n) for c, n in zip(countries, n_s1)}
-    target = min(share[c] for c in countries if c in seen)
+    seen_share = min((share[c] for c in countries if c in seen), default=None)
+    target = seen_share if cfg.unseen_empty_target is None else cfg.unseen_empty_target
     for c, n in zip(countries, n_s1):
         if c in seen:
             continue
@@ -275,7 +278,8 @@ def decide(i: np.ndarray, j: np.ndarray, prob: np.ndarray, pair_country: np.ndar
             scale = hi
         keep[m] = mask(scale)
         info[str(c)] = {"none_scale": round(scale, 4), "empty_share_before": round(share[c], 5),
-                        "empty_share_after": round(_empty_share(gi, keep[m], n), 5), "target": round(target, 5)}
+                        "empty_share_after": round(_empty_share(gi, keep[m], n), 5), "target": round(target, 5),
+                        "seen_share": None if seen_share is None else round(seen_share, 5)}
         log.info("unseen country %s: none_scale %.3f, empty share %.4f -> %.4f (seen countries %.4f)",
                  c, scale, share[c], info[str(c)]["empty_share_after"], target)
     return keep, info
@@ -743,9 +747,9 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_di
         pairs.select("i", "j").with_columns(
             [pl.Series(f"prob_{k}", v.astype(np.float32)) for k, v in probs.items()]).write_parquet(
             scores_dir / "pairs.parquet")
-        recs.select("row", "entity_id", "src", "country_key").write_parquet(scores_dir / "records.parquet")
+        recs.select(RECORD_COLUMNS).write_parquet(scores_dir / "records.parquet")
     pair_country = recs["country_key"].to_numpy()[pairs["i"].to_numpy()]
-    return finish(recs.select("row", "entity_id", "src", "country_key"), pairs.select("i", "j"),
+    return finish(recs.select(RECORD_COLUMNS), pairs.select("i", "j"),
                   select_probability(probs, bundle, pair_country), bundle, prov)
 
 
@@ -781,6 +785,15 @@ def finish(records: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, bundle:
     i, j = pairs["i"].to_numpy(), pairs["j"].to_numpy()
     s1 = records.filter(pl.col("src") == 1)
     keep, calibration = decide(i, j, prob, country[i], s1["country_key"].to_numpy(), bundle)
+    if bundle.config.unseen_rules:
+        seen = set(bundle.report.get("oof_f05_by_country", {}))
+        for c in np.unique(country[i]):
+            if c in seen:
+                continue
+            m = np.flatnonzero(country[i] == c)
+            keep[m], counts = unseen_rules.correct(records, i[m], j[m], prob[m], keep[m])
+            calibration.setdefault(str(c), {}).update(counts)
+            log.info("unseen country %s: post-decision rules %s", c, counts)
     matched = pairs.filter(pl.Series(keep))
     id_of = records["entity_id"].to_numpy()
     ids = s1["entity_id"]

@@ -52,6 +52,13 @@ class Config:
     # Countries without training labels (France): "keep nothing" may be up-weighted
     # by at most this factor to match the seen countries' empty-prediction share.
     unseen_none_cap: float = 4.0
+    # Fixed empty-share target for that calibration (None = the seen countries' share in
+    # the same run). Pinning it keeps an unseen country's decision independent of
+    # predict-time changes to the seen countries (training-pool vocabulary tables).
+    unseen_empty_target: float | None = None
+    # Label-free corrections after the decision for countries without training labels
+    # (unseen_rules.py): legal-form conflict drops, true-variant word and name-tail adds.
+    unseen_rules: bool = False
     # Which probabilities decide: "full" (stage 3), "robust" (stage 3 without the
     # shared-deviation group features) or "none" (stage 2), with per-country
     # overrides. Stage 3 lets a candidate's likely siblings vouch for it. That helps

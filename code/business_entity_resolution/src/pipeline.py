@@ -808,6 +808,7 @@ def set_stage4_meta(bundle_dir: Path, rule: dict, report: dict) -> None:
     """Record stage 4 (stacker file, features, rule, how it was made) in a saved bundle.json."""
     path = bundle_dir / BUNDLE_FILE
     meta = json.loads(path.read_text())
+    meta["config"] = Config.from_dict(meta["config"]).to_dict()  # writes the stage-4 settings in use
     meta["stage4"] = {"features": stage4.FEATURES, "models": [STAGE4_FILE], "rule": rule}
     meta["report"]["stage4"] = report
     path.write_text(json.dumps(meta, indent=2))

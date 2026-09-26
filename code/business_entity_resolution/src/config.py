@@ -23,6 +23,25 @@ def _default_lgb_params():
     }
 
 
+def _default_ce_params():
+    """Pair encoder (stage 4): fine-tuning selection and settings, and the inference batch."""
+    return {
+        # Fine-tuned from this checkpoint (MIT licence); only the shipped weights are read at predict time.
+        "base": "intfloat/multilingual-e5-small@614241f622f53c4eeff9890bdc4f31cfecc418b3",
+        "max_length": 128,
+        "train_s1": 360_000,   # training Source 1 records outside the matcher's sample and holdout
+        "val_s1": 20_000,      # of those, kept out of fitting for the validation check
+        "top_k": 6,            # candidates per record by retrieval score, plus every true pair
+        "batch_size": 128,
+        "lr": 3e-5,
+        "warmup": 0.05,
+        "weight_decay": 0.01,
+        "seed": 0,
+        "infer_batch": 1024,
+        "device": "auto",      # "auto" (Apple GPU, else CUDA, else CPU) or "cpu"
+    }
+
+
 @dataclass(frozen=True)
 class Config:
     # Blocking: top-k Source 2 and top-k Source 3 records per Source 1 record,
@@ -73,6 +92,13 @@ class Config:
     # copy-consensus; the cap restores its training-time meaning.
     feature_caps: dict = field(default_factory=dict)
     feature_cap_countries: list = field(default_factory=list)
+    # Stage 4 (stage4.py): a LightGBM stacker over the decided probability and a fine-tuned
+    # pair encoder's logit on the raw text of pairs whose probability reaches stage4_active.
+    # Scope: "none", "seen" (countries with training labels) or "all" (unseen countries
+    # then go through the calibration and unseen_rules on the stage-4 probability).
+    stage4_scope: str = "none"
+    stage4_active: float = 0.002
+    ce_params: dict = field(default_factory=_default_ce_params)
     lgb_params: dict = field(default_factory=_default_lgb_params)
     stage3_lgb_params: dict = field(default_factory=lambda: {"learning_rate": 0.05, "num_leaves": 63})
 

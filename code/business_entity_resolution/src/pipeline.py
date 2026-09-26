@@ -280,7 +280,7 @@ def decide(i: np.ndarray, j: np.ndarray, prob: np.ndarray, pair_country: np.ndar
         info[str(c)] = {"none_scale": round(scale, 4), "empty_share_before": round(share[c], 5),
                         "empty_share_after": round(_empty_share(gi, keep[m], n), 5), "target": round(target, 5),
                         "seen_share": None if seen_share is None else round(seen_share, 5)}
-        log.info("unseen country %s: none_scale %.3f, empty share %.4f -> %.4f (seen countries %.4f)",
+        log.info("unseen country %s: none_scale %.3f, empty share %.4f -> %.4f (target %.4f)",
                  c, scale, share[c], info[str(c)]["empty_share_after"], target)
     return keep, info
 

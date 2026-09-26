@@ -242,8 +242,9 @@ def decide(i: np.ndarray, j: np.ndarray, prob: np.ndarray, pair_country: np.ndar
     """Final keep mask. Each Source 2/3 record goes to its most likely Source 1 record
     (exclusive owner rule), then the decision rule. For a country absent from training
     (France), the expected-F0.5 rule's "keep nothing" weight is raised until its share
-    of empty Source 1 records matches the seen countries in the same run: an unseen
-    country's probabilities are over-confident, and this uses no labels."""
+    of empty Source 1 records matches the seen countries' share in the same run, or
+    cfg.unseen_empty_target when set: an unseen country's probabilities are
+    over-confident, and this uses no labels."""
     cfg, rule = bundle.config, bundle.rule
     if cfg.exclusive:
         top = pl.DataFrame({"j": j, "p": prob}).select(pl.col("p").max().over("j"))["p"].to_numpy()
@@ -786,6 +787,9 @@ def finish(records: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, bundle:
     s1 = records.filter(pl.col("src") == 1)
     keep, calibration = decide(i, j, prob, country[i], s1["country_key"].to_numpy(), bundle)
     if bundle.config.unseen_rules:
+        missing = [c for c in unseen_rules.COLUMNS if c not in records.columns]
+        if missing:
+            raise data.DataError(f"saved test scores lack {missing} (needed by unseen_rules); re-run `predict`")
         seen = set(bundle.report.get("oof_f05_by_country", {}))
         for c in np.unique(country[i]):
             if c in seen:

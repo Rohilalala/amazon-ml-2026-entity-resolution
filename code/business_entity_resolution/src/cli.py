@@ -84,10 +84,15 @@ def _configure(args) -> None:
     meta = json.loads(path.read_text())
     names = {f.name for f in dataclasses.fields(Config)}
     for item in args.set:
-        name, value = item.split("=", 1)
+        name, eq, value = item.partition("=")
+        if not eq:
+            raise data.DataError(f"--set expects NAME=JSON, got {item!r}")
         if name not in names:
             raise data.DataError(f"unknown setting {name!r}")
-        meta["config"][name] = json.loads(value)
+        try:
+            meta["config"][name] = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise data.DataError(f"--set {name}: value is not JSON ({exc})") from None
     Config.from_dict(meta["config"])
     path.write_text(json.dumps(meta, indent=2))
     log.info("bundle config now %s", meta["config"])

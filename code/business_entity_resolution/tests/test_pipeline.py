@@ -295,3 +295,7 @@ def test_configure_pins_the_unseen_target_and_enables_unseen_rules(trained, tmp_
     if bundle.rule["kind"] == "expected_f05":
         assert france["target"] == 0.5
     assert cli.main(["configure", "--model", str(copy), "--set", "no_such_setting=1"]) == 2
+    assert cli.main(["configure", "--model", str(copy), "--set", "unseen_rules"]) == 2
+    records = copy / "test_scores" / "records.parquet"
+    pl.read_parquet(records).drop("name").write_parquet(records)  # scores saved before unseen_rules existed
+    assert cli.main(["decide", "--model", str(copy), "--out", str(tmp_path / "out")]) == 2

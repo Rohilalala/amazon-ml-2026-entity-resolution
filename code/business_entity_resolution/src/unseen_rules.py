@@ -5,7 +5,8 @@ patterns there. Three corrections use only names, house numbers and streets:
 
 1. Legal-form conflict drop: a kept pair at a nearby house number (one edit, or within
    20) whose names carry different legal forms (sarl vs sas) is a sister company when
-   the Source 1 record already keeps a record at its own house number.
+   the Source 1 record already keeps a record at its own house number (its anchor: an
+   equal-house pair kept by this run's own decision).
 2. True-variant word add: a candidate whose core name is the Source 1 core plus one of
    TRUE_VARIANT_WORDS, at the same house number and without conflicting legal forms.
 3. Generator-tail add: a candidate named like the Source 1 record with its last core
@@ -21,6 +22,8 @@ from rapidfuzz import process
 from rapidfuzz.distance import Levenshtein
 
 COLUMNS = ("name", "core", "addr", "house")
+# The word lists below were measured, without labels, on the unseen country of this test
+# pool (French names); another unseen country needs its own lists.
 LEGAL_FORMS = ["private", "limited", "llp", "llc", "lp", "plc", "incorporated", "corporation", "company", "companies",
                "sarl", "sas", "sasu", "sa", "eurl", "snc", "sci", "inc", "corp", "co", "ltd", "pvt"]
 # Words that, among the test pool's candidates whose core name adds exactly one word to

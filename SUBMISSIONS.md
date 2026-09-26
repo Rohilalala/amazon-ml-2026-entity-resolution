@@ -16,3 +16,9 @@ Scores are out-of-fold macro F0.5 on a sample of training Source 1 records
 
 Leave-one-country-out (v2, stage 1): trained on India, scored on US 0.944;
 trained on US, scored on India 0.864.
+
+## Leaderboard log (exact portal values)
+| When | File | Score | Note |
+|---|---|---|---|
+| 25 Sep 08:36 | output_v3 | 0.964386 | |
+| 25 Sep 22:49 | output_v7_final | **0.971137** | rank 460 on 26 Sep morning; DAY-1 BASE B |

@@ -39,6 +39,31 @@ The two stages can also run separately:
 rule) from the bundle, so it cannot drift from what was validated. The same
 inputs and bundle give byte-identical outputs.
 
+### The submitted bundle (v8)
+
+`artifacts/v8` is the trained v7 bundle with predict-time corrections and no
+retraining. It was made from `artifacts/v7` (models, dictionary, report) with:
+
+```bash
+.venv/bin/python -m src.cli vocab --data DATA --model artifacts/v8
+.venv/bin/python -m src.cli configure --model artifacts/v8 \
+    --set 'feature_caps={"amb_s23_addr_2": 1.0}' --set 'feature_cap_countries=[]' \
+    --set 'stage3_use="none"' --set 'stage3_by_country={"india": "full"}' \
+    --set 'unseen_empty_target=0.05597295153414383' --set 'unseen_rules=true'
+.venv/bin/python -m src.cli predict --data DATA --model artifacts/v8 --out ../../output
+```
+
+- `vocab` saves the training pool's token frequency tables (`vocab_*.parquet`) into
+  the bundle; `train` saves them itself. Predict then reads the leftover-token
+  features of every country with a training pool at training-time frequencies.
+- `feature_caps` clips the pool ambiguity count `amb_s23_addr_2` at 1: the test
+  pool's decoy copy groups inflate it into false copy-consensus.
+- `unseen_empty_target` is the empty-prediction share the unseen country was
+  calibrated to with the v7 probabilities (the seen countries' share then),
+  pinned so the corrections above do not move it.
+- `unseen_rules` turns on the post-decision rules of `src/unseen_rules.py` for
+  countries absent from training.
+
 Check the outputs with the challenge validator before uploading:
 
 ```bash
@@ -54,9 +79,9 @@ python3 utils/validate_submission.py --matching output/matching_results.tsv \
 | Normalise | `src/text.py`, `src/indic.py` | Indic words translated with a dictionary learned from training pairs, then ASCII transliteration; placeholders removed, `&`→`and`, single letters joined (S.A.R.L.→sarl), abbreviations expanded, state names to codes, core name without legal forms, phonetic skeletons |
 | Locale | `src/locale_norm.py` | Label-free: address words that are strongly asymmetric between Source 1 and Source 2/3 within a country (France's region/department phrases) are dropped on both sides |
 | Block | `src/candidates.py` | Per country and source: records become sparse vectors of rare keys (skeleton tokens and pairs, transliteration-aware variants, name prefix/suffix, numbers, rarest address words and their pairs, cross keys). Top-10 by IDF cosine per source, plus reverse top-3 |
-| Features | `src/features.py`, `src/alignment.py` | 78 pair features: fuzzy scores, token and number alignment with corpus frequency, ambiguity counts, character similarity, house-number agreement, retrieval context on both sides |
+| Features | `src/features.py`, `src/alignment.py` | 78 pair features: fuzzy scores, token and number alignment with corpus frequency (the training pool's, for countries that have one), ambiguity counts, character similarity, house-number agreement, retrieval context on both sides; optional predict-time caps (`feature_caps`) |
 | Model | `src/pipeline.py`, `src/groupfeat.py` | Three LightGBM stages cross-validated with folds grouped by Source 1 record: pair features; + stage-1 competition context; + group features comparing each candidate with the likely members of its group. Test prediction = mean of the fold models |
-| Decide | `src/pipeline.py` | Exclusive owner rule, then per-record expected-F0.5 selection; stage-3 or stage-2 probabilities chosen per country (`stage3_use`, `stage3_by_country`); unseen countries calibrated to the seen countries' empty-prediction share |
+| Decide | `src/pipeline.py` | Exclusive owner rule, then per-record expected-F0.5 selection; stage-3 or stage-2 probabilities chosen per country (`stage3_use`, `stage3_by_country`); unseen countries calibrated to the seen countries' empty-prediction share (or a pinned `unseen_empty_target`), then label-free rules for them (`src/unseen_rules.py`: legal-form conflict drops, true-variant word and name-tail adds under the owner rule) |
 | Write | `src/data.py` | Enforces every submission rule, then writes atomically |
 
 Settings live in `src/config.py`; the CLI overrides `--k`, `--k-rev`,
@@ -68,6 +93,8 @@ Other commands:
 .venv/bin/python -m src.cli block  --data DATA --cache CACHE          # blocking recall on train only
 .venv/bin/python -m src.cli decide --model artifacts/model --out OUT \
     --stage3 none --stage3-country india=full                         # re-decide from saved test scores
+.venv/bin/python -m src.cli vocab  --data DATA --model artifacts/model  # add training-pool tables to a bundle
+.venv/bin/python -m src.cli configure --model artifacts/model --set NAME=JSON   # change a saved setting
 ```
 
 ## What training reports
@@ -92,7 +119,10 @@ test set. Every stage logs its duration and peak memory.
 
 Covers normalisation (including transliteration and state names), the metric
 (the worked example in the problem statement, and the vectorised form against
-the reference), the decision rules, input and output checks, and a full
+the reference), the decision rules, the training-pool vocabulary tables (identity
+on the training pool, per-country swap, `vocab` equals what `train` saved), each
+unseen-country rule on a small example, bundle configuration, input and output
+checks, and a full
 train→predict run on a generated dataset with an unseen third country, checked
 with the challenge validator.
 

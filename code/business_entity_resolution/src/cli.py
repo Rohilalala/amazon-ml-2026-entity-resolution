@@ -7,6 +7,8 @@
     python -m src.cli decide  --model artifacts/model --out OUTPUT   (re-decide from saved test scores)
     python -m src.cli vocab   --data DATA --model artifacts/model   (add training-pool vocabulary tables to a bundle)
     python -m src.cli configure --model artifacts/model --set NAME=JSON   (change a setting saved in a bundle)
+    python -m src.cli stage4-train  --data DATA --model artifacts/model --base BASE   (fine-tune + stack stage 4)
+    python -m src.cli stage4-import --model artifacts/model --encoder DIR --stacker FILE.txt --stacker-meta FILE.json
 
 DATA is the dataset/ folder holding train/ and test/. `run` = train + predict.
 Exit codes: 0 success, 2 bad input or output data.
@@ -15,10 +17,13 @@ import argparse
 import dataclasses
 import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 
-from . import data, pipeline
+import lightgbm as lgb
+
+from . import data, pair_encoder, pipeline, stage4
 from .config import Config
 
 log = logging.getLogger("ber")
@@ -60,6 +65,8 @@ def _decide(args) -> None:
         if bad:
             raise data.DataError(f"--stage3-country values must be one of {pipeline.STAGE3_CHOICES}, got {bad}")
         bundle.config = dataclasses.replace(bundle.config, stage3_by_country=overrides)
+    if args.stage4_scope is not None:
+        bundle.config = dataclasses.replace(bundle.config, stage4_scope=args.stage4_scope)
     records, pairs, probs = pipeline.load_scores(args.model)
     pair_country = records["country_key"].to_numpy()[pairs["i"].to_numpy()]
     _, matches, cands, report = pipeline.finish(records, pairs, pipeline.select_probability(probs, bundle, pair_country),
@@ -67,6 +74,25 @@ def _decide(args) -> None:
     report["stage3_use"] = bundle.config.stage3_use
     report["stage3_by_country"] = bundle.config.stage3_by_country
     _write(args, matches, cands, report)
+
+
+def _stage4_import(args) -> None:
+    """Put an already fine-tuned encoder and a trained stage-4 stacker into a bundle."""
+    pipeline.Bundle.load(args.model)  # the bundle must exist
+    meta = json.loads(args.stacker_meta.read_text())
+    if meta.get("features") != stage4.FEATURES or lgb.Booster(model_file=str(args.stacker)).num_feature() != len(stage4.FEATURES):
+        raise data.DataError(f"{args.stacker}: stacker features are not {stage4.FEATURES}")
+    if not (args.encoder / "model.safetensors").is_file():
+        raise data.DataError(f"no model.safetensors in {args.encoder}")
+    shutil.copytree(args.encoder, args.model / pair_encoder.ENCODER_DIR, dirs_exist_ok=True)
+    shutil.copyfile(args.stacker, args.model / pipeline.STAGE4_FILE)
+    pipeline.set_stage4_meta(args.model, meta["rule"], {
+        "imported": {"encoder": str(args.encoder), "stacker": str(args.stacker), "rounds": meta.get("rounds"),
+                     "encoder_sha256": pipeline._sha256(args.encoder / "model.safetensors"),
+                     "stacker_sha256": pipeline._sha256(args.stacker)}})
+    bundle = pipeline.Bundle.load(args.model)
+    log.info("stage 4 imported into %s: %d trees, rule %s", args.model, bundle.stage4.boosters[0].num_trees(),
+             bundle.stage4_rule)
 
 
 def _vocab(args) -> None:
@@ -93,7 +119,7 @@ def _configure(args) -> None:
             meta["config"][name] = json.loads(value)
         except json.JSONDecodeError as exc:
             raise data.DataError(f"--set {name}: value is not JSON ({exc})") from None
-    Config.from_dict(meta["config"])
+    stage4.countries(Config.from_dict(meta["config"]).stage4_scope, set(), [])  # validates the scope
     path.write_text(json.dumps(meta, indent=2))
     log.info("bundle config now %s", meta["config"])
 
@@ -129,6 +155,8 @@ def main(argv=None) -> int:
                            help="which probabilities decide: full, robust or none (stage 2)")
             p.add_argument("--stage3-country", action="append", default=None, metavar="COUNTRY=CHOICE",
                            help="per-country override, e.g. india=full (repeatable)")
+            p.add_argument("--stage4-scope", choices=stage4.SCOPES, default=None,
+                           help="countries decided on stage 4: none, seen (with training labels) or all")
         if name != "predict":
             d = Config()
             p.add_argument("--k", type=int, default=d.k, help="candidates per Source 1 record and source")
@@ -142,6 +170,16 @@ def main(argv=None) -> int:
     p = sub.add_parser("vocab")
     p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
     p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
+    p = sub.add_parser("stage4-train")
+    p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
+    p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder (with oof.parquet)")
+    p.add_argument("--base", type=Path, required=True, help="local copy of the base encoder checkpoint")
+    p.add_argument("--cache", type=Path, default=None, help="reuse the prepared training records and candidates")
+    p = sub.add_parser("stage4-import")
+    p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
+    p.add_argument("--encoder", type=Path, required=True, help="fine-tuned encoder folder (weights + tokenizer)")
+    p.add_argument("--stacker", type=Path, required=True, help="stage-4 LightGBM model file")
+    p.add_argument("--stacker-meta", type=Path, required=True, help="JSON with its features and decision rule")
     p = sub.add_parser("configure")
     p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
     p.add_argument("--set", action="append", required=True, metavar="NAME=JSON",
@@ -163,6 +201,10 @@ def main(argv=None) -> int:
             _vocab(args)
         elif args.command == "configure":
             _configure(args)
+        elif args.command == "stage4-train":
+            pipeline.train_stage4(args.data, args.model, args.base, cache=args.cache)
+        elif args.command == "stage4-import":
+            _stage4_import(args)
         else:
             _predict(args, _train(args))
     except data.DataError as exc:

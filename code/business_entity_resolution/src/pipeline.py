@@ -24,7 +24,8 @@ import numpy as np
 import polars as pl
 from sklearn.model_selection import GroupKFold
 
-from . import alignment, candidates, data, features, groupfeat, indic, locale_norm, text, unseen_rules
+from . import alignment, candidates, data, features, groupfeat, indic, locale_norm, pair_encoder, stage4, text, \
+    unseen_rules
 from .config import Config
 from .metric import f05_counts
 
@@ -35,7 +36,8 @@ MISSED_GRID = (0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
 BUNDLE_FILE = "bundle.json"
 NATIVE_FILE = "native_words.json"
 VOCAB_FILE = "vocab_{}.parquet"
-PACKAGES = ("numpy", "polars", "scipy", "scikit-learn", "lightgbm", "rapidfuzz", "anyascii")
+PACKAGES = ("numpy", "polars", "scipy", "scikit-learn", "lightgbm", "rapidfuzz", "anyascii", "torch", "transformers")
+STAGE4_FILE = "stage4.txt"
 NON_FEATURES = {"i", "j", "y", "jsrc"}
 # Stage 3 rescores only pairs whose stage-2 probability reaches this value.
 STAGE3_ACTIVE = 0.001
@@ -238,35 +240,45 @@ def _empty_share(group: np.ndarray, keep: np.ndarray, n_s1: int) -> float:
 
 
 def decide(i: np.ndarray, j: np.ndarray, prob: np.ndarray, pair_country: np.ndarray, s1_country: np.ndarray,
-           bundle: "Bundle") -> tuple[np.ndarray, dict]:
+           bundle: "Bundle", stage4_countries: list = ()) -> tuple[np.ndarray, dict]:
     """Final keep mask. Each Source 2/3 record goes to its most likely Source 1 record
     (exclusive owner rule), then the decision rule. For a country absent from training
     (France), the expected-F0.5 rule's "keep nothing" weight is raised until its share
     of empty Source 1 records matches the seen countries' share in the same run, or
     cfg.unseen_empty_target when set: an unseen country's probabilities are
-    over-confident, and this uses no labels."""
-    cfg, rule = bundle.config, bundle.rule
+    over-confident, and this uses no labels. Pairs of `stage4_countries` carry stage-4
+    probabilities and are decided with the stage-4 rule."""
+    cfg = bundle.config
     if cfg.exclusive:
         top = pl.DataFrame({"j": j, "p": prob}).select(pl.col("p").max().over("j"))["p"].to_numpy()
         prob = np.where(prob >= top, prob, 0.0)
-    keep = apply_rule(rule, i, prob) & (prob > 0)
+
+    def rule_of(c):
+        return bundle.stage4_rule if c in stage4_countries else bundle.rule
+    if len(stage4_countries):
+        m4 = np.isin(pair_country, list(stage4_countries))
+        keep = np.zeros(len(prob), dtype=bool)
+        for m, rule in ((m4, bundle.stage4_rule), (~m4, bundle.rule)):
+            keep[m] = apply_rule(rule, i[m], prob[m]) & (prob[m] > 0)
+    else:
+        keep = apply_rule(bundle.rule, i, prob) & (prob > 0)
     info = {}
     seen = set(bundle.report.get("oof_f05_by_country", {}))
     countries, n_s1 = np.unique(s1_country, return_counts=True)
-    unseen = [c for c in countries if c not in seen]
-    if rule["kind"] != "expected_f05" or not unseen or cfg.unseen_none_cap <= 1 or not seen:
+    unseen = [c for c in countries if c not in seen and rule_of(c)["kind"] == "expected_f05"]
+    if not unseen or cfg.unseen_none_cap <= 1 or not seen:
         return keep, info
     share = {c: _empty_share(i[pair_country == c], keep[pair_country == c], n) for c, n in zip(countries, n_s1)}
     seen_share = min((share[c] for c in countries if c in seen), default=None)
     target = seen_share if cfg.unseen_empty_target is None else cfg.unseen_empty_target
     for c, n in zip(countries, n_s1):
-        if c in seen:
+        if c not in unseen:
             continue
         m = pair_country == c
-        gi, pc = i[m], prob[m]
+        gi, pc, missed = i[m], prob[m], rule_of(c)["missed"]
 
         def mask(scale):
-            return expected_f05_mask(gi, pc, rule["missed"], scale) & (pc > 0)
+            return expected_f05_mask(gi, pc, missed, scale) & (pc > 0)
         lo, hi = 1.0, float(cfg.unseen_none_cap)
         if share[c] >= target:
             scale = 1.0
@@ -309,6 +321,8 @@ class Bundle:
     variants: dict = field(default_factory=dict)  # alternative stage-3 models, e.g. {"robust": Stage}
     oof: pl.DataFrame | None = None  # out-of-fold predictions, saved for error analysis
     vocab: dict | None = None  # training-pool vocabulary tables (alignment.vocab_tables)
+    stage4: Stage | None = None  # stage-4 stacker (its pair encoder lives in <bundle>/encoder)
+    stage4_rule: dict | None = None
 
     def save(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -330,6 +344,9 @@ class Bundle:
             variants[name] = {"features": stage.features, "models": files}
         meta = {"config": self.config.to_dict(), "stages": stages, "variants": variants,
                 "rule": self.rule, "report": self.report}
+        if self.stage4:
+            self.stage4.boosters[0].save_model(directory / STAGE4_FILE)
+            meta["stage4"] = {"features": self.stage4.features, "models": [STAGE4_FILE], "rule": self.stage4_rule}
         (directory / BUNDLE_FILE).write_text(json.dumps(meta, indent=2))
         (directory / NATIVE_FILE).write_text(json.dumps(self.native_words or {}, ensure_ascii=False,
                                                         sort_keys=True), encoding="utf-8")
@@ -353,9 +370,10 @@ class Bundle:
         words = json.loads(native.read_text(encoding="utf-8")) if native.is_file() else {}
         vocab = {k: pl.read_parquet(directory / VOCAB_FILE.format(k)) for k in alignment.VOCAB
                  if (directory / VOCAB_FILE.format(k)).is_file()}
+        st4 = meta.get("stage4")
         return cls(Config.from_dict(meta["config"]), [stage(st) for st in meta["stages"]], meta["rule"],
                    meta["report"], words, {k: stage(v) for k, v in meta.get("variants", {}).items()},
-                   vocab=vocab or None)
+                   vocab=vocab or None, stage4=stage(st4) if st4 else None, stage4_rule=st4 and st4["rule"])
 
 
 def save_vocab(directory: Path, vocab: dict) -> None:
@@ -506,6 +524,14 @@ def evaluate_blocking(data_dir: Path, cfg: Config, cache: Path | None = None) ->
     return _blocking_report(pairs, n_true)
 
 
+def sample_and_holdout(n_true_all: pl.DataFrame, cfg: Config) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Source 1 records the matcher is trained on (their candidates come from the full pool),
+    and the holdout: records used by neither stage, scored exactly as the test set is."""
+    shuffled = n_true_all.sample(fraction=1.0, shuffle=True, seed=cfg.seed)
+    sample = shuffled.head(min(cfg.train_s1_sample, n_true_all.height)).sort("row")
+    return sample, shuffled.slice(sample.height, cfg.holdout_s1).sort("row")
+
+
 def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path | None = None) -> Bundle:
     """Candidates for the whole training split, a matcher cross-validated on a
     sample of Source 1 records, and the decision rule that maximises macro F0.5."""
@@ -526,11 +552,7 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
         .with_columns(pl.col("n_true").fill_null(0))
     blocking = _blocking_report(pairs, n_true_all)
 
-    # Sample Source 1 records for the matcher; their candidates come from the full pool.
-    shuffled = n_true_all.sample(fraction=1.0, shuffle=True, seed=cfg.seed)
-    sample = shuffled.head(min(cfg.train_s1_sample, n_true_all.height)).sort("row")
-    # Holdout: Source 1 records used by neither stage, scored exactly as the test set is.
-    holdout = shuffled.slice(sample.height, cfg.holdout_s1).sort("row")
+    sample, holdout = sample_and_holdout(n_true_all, cfg)
     code_of = np.full(recs.height, -1, dtype=np.int64)
     code_of[sample["row"].to_numpy()] = np.arange(sample.height)
     in_sample = pairs["i"].is_in(sample["row"].implode()).to_numpy()
@@ -718,15 +740,93 @@ def _country_transfer(X, y, codes, n_true, country, cfg, rounds) -> dict:
     return out
 
 
+def train_stage4(data_dir: Path, bundle_dir: Path, base: Path, cache: Path | None = None) -> dict:
+    """Stage 4 for a trained bundle: fine-tune the pair encoder from the `base` checkpoint,
+    then cross-validate the stacker on the matcher's training sample and save both.
+
+    Encoder data: training Source 1 records outside the matcher's sample and holdout
+    (stage4.encoder_pairs), minus pairs whose candidate belongs to an active sample pair.
+    Stacker rows: the active sample pairs, with the out-of-fold probability each is decided
+    on (oof.parquet, stage-3 choice per country as configured) and the new encoder's logit;
+    folds grouped by Source 1 record as in `train`; the decision rule is chosen on the
+    out-of-fold stage-4 probability, and the final model is refit on all active pairs with
+    the mean best iteration."""
+    bundle = Bundle.load(bundle_dir)
+    cfg, params = bundle.config, bundle.config.ce_params
+    if not (bundle_dir / "oof.parquet").is_file():
+        raise data.DataError(f"{bundle_dir}/oof.parquet is needed to train stage 4")
+    raw = data.load_split(data_dir, "train")
+    truth = data.load_truth(data_dir / "train" / "train_ground_truth.tsv", raw)
+    prov = provenance(data_dir, "train")
+    native = bundle.native_words or {}
+    text.set_native_words(native)
+    pair_text = pair_encoder.texts(raw)
+    recs, pairs = candidate_table(raw, cfg, {**prov["inputs"], "native_words": _dict_hash(native)}, cache)
+    del raw
+    s1 = recs.filter(pl.col("src") == 1).select("row", "country_key")
+    n_true_all = s1.join(truth.group_by("i").len("n_true"), left_on="row", right_on="i", how="left") \
+        .with_columns(pl.col("n_true").fill_null(0))
+    sample, holdout = sample_and_holdout(n_true_all, cfg)
+    oof = pl.read_parquet(bundle_dir / "oof.parquet")
+    if not oof["i"].is_in(sample["row"].implode()).all():
+        raise data.DataError("oof.parquet does not match this training split and configuration")
+    country = recs["country_key"].to_numpy()[oof["i"].to_numpy()]
+    oof_probs = {"stage2": oof["oof_stage2"].to_numpy(), "full": oof["oof"].to_numpy()}
+    if "oof_robust" in oof.columns:
+        oof_probs["robust"] = oof["oof_robust"].to_numpy()
+    prob = select_probability(oof_probs, bundle, country)
+    act = prob >= cfg.stage4_active
+    A = oof.filter(pl.Series(act)).select("i", "j", "y", "entity")
+    used = pl.concat([sample["row"], holdout["row"]])
+    fit_pairs, val_pairs = stage4.encoder_pairs(pairs, truth, n_true_all.filter(~pl.col("row").is_in(used.implode())),
+                                                params, A["j"].unique())
+    del recs, pairs
+    gc.collect()
+    enc_dir = bundle_dir / pair_encoder.ENCODER_DIR
+    enc_report = pair_encoder.train(base, enc_dir, pair_text, fit_pairs, val_pairs, params)
+    ce = pair_encoder.score(enc_dir, pair_text, A["i"].to_numpy(), A["j"].to_numpy(), params)
+    F = stage4.features(A.with_columns(prob=pl.Series(prob[act]), ce_logit=pl.Series(ce)),
+                        pair_encoder.empty_address(pair_text))
+    x, y, codes = stage4.matrix(F), A["y"].to_numpy(), oof["entity"].to_numpy()
+    oof4, boosters = cross_validate(x, y, fold_ids(A["entity"].to_numpy(), cfg), cfg)
+    p4 = prob.astype(np.float64)
+    p4[act] = oof4
+    n_true, y_all = sample["n_true"].to_numpy(), oof["y"].to_numpy()
+    f4, rule, trials = choose_rule(codes, n_true, p4, y_all)
+    rounds = max(1, int(np.mean([b.best_iteration for b in boosters])))
+    bundle.stage4, bundle.stage4_rule = Stage(stage4.FEATURES, [fit(x, y, cfg, rounds=rounds)]), rule
+    report = {"encoder": enc_report, "active_pairs": int(act.sum()), "fold_rounds": [b.best_iteration for b in boosters],
+              "final_rounds": rounds, "oof_f05": round(f4, 5), "rule": rule, "rule_trials": trials,
+              "oof_f05_without_stage4": round(choose_rule(codes, n_true, prob, y_all)[0], 5)}
+    log.info("stage 4: %s", report)
+    bundle.stage4.boosters[0].save_model(bundle_dir / STAGE4_FILE)
+    set_stage4_meta(bundle_dir, bundle.stage4_rule, {**report, "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    return report
+
+
+def set_stage4_meta(bundle_dir: Path, rule: dict, report: dict) -> None:
+    """Record stage 4 (stacker file, features, rule, how it was made) in a saved bundle.json."""
+    path = bundle_dir / BUNDLE_FILE
+    meta = json.loads(path.read_text())
+    meta["stage4"] = {"features": stage4.FEATURES, "models": [STAGE4_FILE], "rule": rule}
+    meta["report"]["stage4"] = report
+    path.write_text(json.dumps(meta, indent=2))
+
+
 def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_dir: Path | None = None
             ) -> tuple[pl.Series, pl.DataFrame, pl.DataFrame, dict]:
     """Matches and candidates for every test Source 1 record, checked against the
     submission rules. Returns (ids, match lists, candidate lists, report)."""
+    if bundle.config.stage4_scope != "none" and (bundle.stage4 is None or bundle_dir is None
+                                                 or not (bundle_dir / pair_encoder.ENCODER_DIR).is_dir()):
+        raise data.DataError(f"stage4_scope={bundle.config.stage4_scope!r} needs a bundle with stage 4 (encoder/ "
+                             f"and {STAGE4_FILE}); see `stage4-import` / `stage4-train`")
     raw = data.load_split(data_dir, "test")
     prov = provenance(data_dir, "test")
     native = bundle.native_words or {}
     text.set_native_words(native)
     recs, pairs = candidate_table(raw, bundle.config, {**prov["inputs"], "native_words": _dict_hash(native)}, cache)
+    pair_text = pair_encoder.texts(raw) if bundle.config.stage4_scope != "none" else None
     del raw
     t0 = time.time()
     tables = alignment.pool_tables(recs)
@@ -742,16 +842,31 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_di
         if pairs.height else {"stage2": np.zeros(0), "full": np.zeros(0)}
     log.info("scored %d pairs with %d stage(s) in %.1fs (peak %.1f GB)", pairs.height, len(bundle.stages),
              time.time() - t0, peak_gb())
+    del tables
+    records, pairs = recs.select(RECORD_COLUMNS), pairs.select("i", "j")
+    del recs
+    pair_country = records["country_key"].to_numpy()[pairs["i"].to_numpy()]
+    prob = select_probability(probs, bundle, pair_country)
+    scored = pairs.with_columns([pl.Series(f"prob_{k}", v.astype(np.float32)) for k, v in probs.items()])
+    if pair_text is not None:
+        # Every active pair is encoded, whatever the scope, so `decide` can switch scope.
+        records = records.with_columns(pl.Series("addr_empty", pair_encoder.empty_address(pair_text)))
+        act = np.flatnonzero(prob >= cfg.stage4_active)
+        ce = np.full(pairs.height, np.nan, dtype=np.float32)
+        t0 = time.time()
+        ce[act] = pair_encoder.score(bundle_dir / pair_encoder.ENCODER_DIR, pair_text, pairs["i"].to_numpy()[act],
+                                     pairs["j"].to_numpy()[act], cfg.ce_params)
+        log.info("pair encoder: %d active pairs in %.0fs (peak %.1f GB)", len(act), time.time() - t0, peak_gb())
+        del pair_text
+        pairs = pairs.with_columns(pl.Series("ce_logit", ce))
+        scored = scored.with_columns(pl.Series("ce_logit", ce))
     scores_dir = bundle_dir / "test_scores" if bundle_dir else None
     if scores_dir:
         scores_dir.mkdir(parents=True, exist_ok=True)
-        pairs.select("i", "j").with_columns(
-            [pl.Series(f"prob_{k}", v.astype(np.float32)) for k, v in probs.items()]).write_parquet(
-            scores_dir / "pairs.parquet")
-        recs.select(RECORD_COLUMNS).write_parquet(scores_dir / "records.parquet")
-    pair_country = recs["country_key"].to_numpy()[pairs["i"].to_numpy()]
-    return finish(recs.select(RECORD_COLUMNS), pairs.select("i", "j"),
-                  select_probability(probs, bundle, pair_country), bundle, prov)
+        scored.write_parquet(scores_dir / "pairs.parquet")
+        records.write_parquet(scores_dir / "records.parquet")
+    del scored
+    return finish(records, pairs, prob, bundle, prov)
 
 
 def select_probability(probs: dict, bundle: Bundle, pair_country: np.ndarray) -> np.ndarray:
@@ -770,22 +885,37 @@ def select_probability(probs: dict, bundle: Bundle, pair_country: np.ndarray) ->
 
 
 def load_scores(bundle_dir: Path) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
-    """Records, candidate pairs and every saved probability column from the last predict()."""
+    """Records, candidate pairs (with the pair-encoder logit when predict saved one) and every
+    saved probability column from the last predict()."""
     d = bundle_dir / "test_scores"
     if not (d / "pairs.parquet").is_file():
         raise data.DataError(f"no saved test scores in {d}; run `predict` first")
     scored = pl.read_parquet(d / "pairs.parquet")
     probs = {c.removeprefix("prob_"): scored[c].to_numpy() for c in scored.columns if c.startswith("prob_")}
-    return pl.read_parquet(d / "records.parquet"), scored.select("i", "j"), probs
+    pairs = scored.select(c for c in ("i", "j", "ce_logit") if c in scored.columns)
+    return pl.read_parquet(d / "records.parquet"), pairs, probs
 
 
 def finish(records: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, bundle: Bundle, prov: dict | None = None
            ) -> tuple[pl.Series, pl.DataFrame, pl.DataFrame, dict]:
-    """Decision rule, id lists and submission checks from scored pairs."""
+    """Decision rule, id lists and submission checks from scored pairs. With stage 4 in scope,
+    `pairs` carries the pair-encoder logit (ce_logit) and `records` the empty-address flag."""
     country = records["country_key"].to_numpy()
     i, j = pairs["i"].to_numpy(), pairs["j"].to_numpy()
     s1 = records.filter(pl.col("src") == 1)
-    keep, calibration = decide(i, j, prob, country[i], s1["country_key"].to_numpy(), bundle)
+    cfg = bundle.config
+    s4 = stage4.countries(cfg.stage4_scope, set(bundle.report.get("oof_f05_by_country", {})), np.unique(country[i]))
+    stage4_report = {"scope": cfg.stage4_scope, "countries": [str(c) for c in s4]}
+    if s4:
+        act = (prob >= cfg.stage4_active) & np.isin(country[i], s4)
+        ce = pairs["ce_logit"].to_numpy() if "ce_logit" in pairs.columns else None
+        if bundle.stage4 is None or ce is None or np.isnan(ce[act]).any():
+            raise data.DataError("saved test scores lack pair-encoder logits; re-run `predict` with stage4_scope set")
+        prob = stage4.probability(bundle.stage4, i, j, prob, ce, records["addr_empty"].to_numpy(), act)
+        stage4_report["active_pairs"] = int(act.sum())
+        log.info("stage 4 rescored %d active pairs of %s", int(act.sum()), stage4_report["countries"])
+    pairs = pairs.select("i", "j")
+    keep, calibration = decide(i, j, prob, country[i], s1["country_key"].to_numpy(), bundle, s4)
     if bundle.config.unseen_rules:
         missing = [c for c in unseen_rules.COLUMNS if c not in records.columns]
         if missing:
@@ -813,5 +943,5 @@ def finish(records: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, bundle:
         log.info("test %s: %s", c, v)
     report = {"predicted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "test_s1": len(ids),
               "test_pairs": pairs.height, "matched_pairs": matched.height, "by_country": by_country,
-              "unseen_country_calibration": calibration, "provenance": prov}
+              "unseen_country_calibration": calibration, "stage4": stage4_report, "provenance": prov}
     return ids, match_lists, cand_lists, report

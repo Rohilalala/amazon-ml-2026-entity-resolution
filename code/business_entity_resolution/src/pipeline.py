@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
 
@@ -788,7 +788,8 @@ def train_stage4(data_dir: Path, bundle_dir: Path, base: Path, cache: Path | Non
     F = stage4.features(A.with_columns(prob=pl.Series(prob[act]), ce_logit=pl.Series(ce)),
                         pair_encoder.empty_address(pair_text))
     x, y, codes = stage4.matrix(F), A["y"].to_numpy(), oof["entity"].to_numpy()
-    oof4, boosters = cross_validate(x, y, fold_ids(A["entity"].to_numpy(), cfg), cfg)
+    cfg4 = replace(cfg, folds=stage4.FOLDS)
+    oof4, boosters = cross_validate(x, y, fold_ids(A["entity"].to_numpy(), cfg4), cfg4)
     p4 = prob.astype(np.float64)
     p4[act] = oof4
     n_true, y_all = sample["n_true"].to_numpy(), oof["y"].to_numpy()

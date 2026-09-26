@@ -11,6 +11,7 @@ import polars as pl
 from .data import DataError
 
 FEATURES = ["lp", "ce", "b_empty", "ce_rank", "ce_gap", "lp_rank", "lp_gap", "n_i"]
+FOLDS = 5  # stacker cross-validation folds (grouped by Source 1 record)
 SCOPES = ("none", "seen", "all")
 
 

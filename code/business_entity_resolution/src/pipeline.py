@@ -34,6 +34,7 @@ THRESHOLDS = np.round(np.arange(0.05, 0.96, 0.01), 2)
 MISSED_GRID = (0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8)
 BUNDLE_FILE = "bundle.json"
 NATIVE_FILE = "native_words.json"
+VOCAB_FILE = "vocab_{}.parquet"
 PACKAGES = ("numpy", "polars", "scipy", "scikit-learn", "lightgbm", "rapidfuzz", "anyascii")
 NON_FEATURES = {"i", "j", "y", "jsrc"}
 # Stage 3 rescores only pairs whose stage-2 probability reaches this value.
@@ -68,6 +69,12 @@ def _cache_key(inputs: dict, cfg: Config) -> str:
     return h.hexdigest()[:16]
 
 
+def _locale_rules(raw: pl.DataFrame) -> dict:
+    return locale_norm.learn(raw.select(
+        pl.col("country").str.strip_chars().str.to_lowercase().alias("country_key"), "src",
+        text.clean_address(raw["business_address"]).alias("addr")))
+
+
 def candidate_table(raw: pl.DataFrame, cfg: Config, inputs: dict,
                     cache: Path | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Prepared records and their candidate pairs with retrieval-context features.
@@ -78,9 +85,7 @@ def candidate_table(raw: pl.DataFrame, cfg: Config, inputs: dict,
     # Locale rules (label-free, learned from this split's addresses) are part of what
     # the candidate table depends on; they are empty for the US/India training data,
     # so they only enter the cache key when they change something.
-    rules = locale_norm.learn(raw.select(
-        pl.col("country").str.strip_chars().str.to_lowercase().alias("country_key"), "src",
-        text.clean_address(raw["business_address"]).alias("addr")))
+    rules = _locale_rules(raw)
     if rules:
         log.info("locale rules: %s", rules)
         inputs = {**inputs, "locale_rules": rules}
@@ -298,6 +303,7 @@ class Bundle:
     native_words: dict | None = None  # Indic -> English dictionary learned in training
     variants: dict = field(default_factory=dict)  # alternative stage-3 models, e.g. {"robust": Stage}
     oof: pl.DataFrame | None = None  # out-of-fold predictions, saved for error analysis
+    vocab: dict | None = None  # training-pool vocabulary tables (alignment.vocab_tables)
 
     def save(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -324,6 +330,7 @@ class Bundle:
                                                         sort_keys=True), encoding="utf-8")
         if self.oof is not None:
             self.oof.write_parquet(directory / "oof.parquet")
+        save_vocab(directory, self.vocab or {})
         log.info("saved bundle to %s", directory)
 
     @classmethod
@@ -339,8 +346,25 @@ class Bundle:
             return Stage(st["features"], boosters)
         native = directory / NATIVE_FILE
         words = json.loads(native.read_text(encoding="utf-8")) if native.is_file() else {}
+        vocab = {k: pl.read_parquet(directory / VOCAB_FILE.format(k)) for k in alignment.VOCAB
+                 if (directory / VOCAB_FILE.format(k)).is_file()}
         return cls(Config.from_dict(meta["config"]), [stage(st) for st in meta["stages"]], meta["rule"],
-                   meta["report"], words, {k: stage(v) for k, v in meta.get("variants", {}).items()})
+                   meta["report"], words, {k: stage(v) for k, v in meta.get("variants", {}).items()},
+                   vocab=vocab or None)
+
+
+def save_vocab(directory: Path, vocab: dict) -> None:
+    for k, v in vocab.items():
+        v.write_parquet(directory / VOCAB_FILE.format(k))
+
+
+def train_vocab(data_dir: Path, bundle: Bundle) -> dict:
+    """Training-pool vocabulary tables for a bundle trained before they were saved with
+    it: the training records prepared exactly as in training (same Indic dictionary)."""
+    raw = data.load_split(data_dir, "train")
+    text.set_native_words(bundle.native_words or {})
+    recs = locale_norm.apply(features.prepare(raw), _locale_rules(raw))
+    return alignment.vocab_tables(recs)
 
 
 def apply_feature_caps(x: np.ndarray, names: list[str], caps: dict, mask: np.ndarray | None) -> None:
@@ -615,7 +639,7 @@ def train(data_dir: Path, cfg: Config, country_check: bool = True, cache: Path |
     report["train_seconds"] = round(time.time() - t_start, 1)
     if oof_robust is not None:
         report["oof_f05_stage3_robust"] = round(choose_rule(codes, n_true, oof_robust, y)[0], 5)
-    bundle = Bundle(cfg, stages, rule, report, native, variants)
+    bundle = Bundle(cfg, stages, rule, report, native, variants, vocab={k: tables[k] for k in alignment.VOCAB})
     extra = [pl.Series(n, v.astype(np.float32)) for n, v in (("oof_stage2", oof_stage2), ("oof_robust", oof_robust))
              if v is not None]
     bundle.oof = ids.with_columns(pl.Series("oof", oof.astype(np.float32)), pl.Series("entity", codes), *extra)
@@ -701,6 +725,9 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_di
     del raw
     t0 = time.time()
     tables = alignment.pool_tables(recs)
+    if bundle.vocab:
+        tables = alignment.with_vocab(tables, bundle.vocab)
+        log.info("training-pool vocabulary tables for %s", bundle.vocab["floor"]["country_key"].to_list())
     cfg = bundle.config
     if cfg.feature_caps:
         log.info("predict-time feature caps %s on countries %s", cfg.feature_caps,

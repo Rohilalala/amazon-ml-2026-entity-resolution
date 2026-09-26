@@ -10,7 +10,12 @@ Ambiguity counts say how many records in the pool share a name or address:
 name-only evidence is weak when six Source 1 businesses carry that name.
 
 Everything here is label-free and computed from the pool of the split being
-processed (training pool at train time, test pool at test time).
+processed (training pool at train time, test pool at test time), except that a
+bundle may carry the training pool's vocabulary tables (token frequencies): the
+leftover-token features then read a word the way training did for every country
+that has a training pool. The test pool's decoy businesses shift word frequencies
+('group', 'holdings', 'enterprises'), and the model uses these frequencies almost
+as word identities.
 """
 import numpy as np
 import polars as pl
@@ -20,6 +25,7 @@ from rapidfuzz.distance import Levenshtein
 from sklearn.feature_extraction.text import HashingVectorizer
 
 AMB_KEYS = ("core", "skel", "addr")
+VOCAB = ("floor", "df_core", "df_addr")
 BAG_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
 IDF_CHUNK = 1_000_000
 _HASH = HashingVectorizer(analyzer="char_wb", ngram_range=(3, 3), n_features=1 << 20,
@@ -35,17 +41,7 @@ def pool_tables(recs: pl.DataFrame) -> dict:
         out["amb"][key] = (lf.filter(pl.col(key) != "").group_by("country_key", key)
                            .agg((pl.col("src") == 1).sum().cast(pl.Float32).alias("s1"),
                                 (pl.col("src") != 1).sum().cast(pl.Float32).alias("s23")).collect())
-    n = lf.group_by("country_key").agg(pl.len().alias("n")).collect()
-    out["floor"] = n.select("country_key", (1.0 / pl.col("n")).log().cast(pl.Float32).alias("floor"))
-    for col, words_only in (("core", False), ("addr", True)):
-        t = pl.col(col).str.split(" ").list.unique()
-        if words_only:
-            t = t.list.eval(pl.element().filter(~pl.element().str.contains(r"\d")))
-        out[f"df_{col}"] = (lf.select("country_key", t.alias("t")).explode("t").filter(pl.col("t") != "")
-                            .group_by("country_key", "t").len("df").filter(pl.col("df") >= 2)
-                            .join(n.lazy(), on="country_key")
-                            .select("country_key", "t", (pl.col("df") / pl.col("n")).log().cast(pl.Float32).alias("ldf"))
-                            .collect())
+    out |= vocab_tables(recs)
     # Trigram IDF with document frequencies accumulated chunk by chunk (flat memory);
     # same formula as sklearn's TfidfTransformer(smooth_idf=True).
     core = recs["core"]
@@ -55,6 +51,32 @@ def pool_tables(recs: pl.DataFrame) -> dict:
         df += np.bincount(x.indices, minlength=_HASH.n_features)
     out["idf"] = (np.log((1 + len(core)) / (1 + df)) + 1).astype(np.float32)
     return out
+
+
+def vocab_tables(recs: pl.DataFrame) -> dict:
+    """Per-country token log document frequencies of core-name tokens (df_core) and
+    address words (df_addr), and the log frequency of an unseen token (floor)."""
+    lf = recs.lazy().select("country_key", "core", "addr")
+    n = lf.group_by("country_key").agg(pl.len().alias("n")).collect()
+    out = {"floor": n.select("country_key", (1.0 / pl.col("n")).log().cast(pl.Float32).alias("floor"))}
+    for col, words_only in (("core", False), ("addr", True)):
+        t = pl.col(col).str.split(" ").list.unique()
+        if words_only:
+            t = t.list.eval(pl.element().filter(~pl.element().str.contains(r"\d")))
+        out[f"df_{col}"] = (lf.select("country_key", t.alias("t")).explode("t").filter(pl.col("t") != "")
+                            .group_by("country_key", "t").len("df").filter(pl.col("df") >= 2)
+                            .join(n.lazy(), on="country_key")
+                            .select("country_key", "t", (pl.col("df") / pl.col("n")).log().cast(pl.Float32).alias("ldf"))
+                            .collect())
+    return out
+
+
+def with_vocab(tables: dict, vocab: dict) -> dict:
+    """`tables` with the vocabulary tables of every country in `vocab` taken from `vocab`
+    (the training pool); other countries keep the tables of their own pool."""
+    have = vocab["floor"]["country_key"].implode()
+    return {**tables, **{k: pl.concat([tables[k].filter(~pl.col("country_key").is_in(have)), v])
+                         for k, v in vocab.items()}}
 
 
 def _amb(R: pl.DataFrame, tables: dict, side: str) -> dict:

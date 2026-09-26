@@ -5,6 +5,8 @@
     python -m src.cli run     --data DATA --model artifacts/model --out OUTPUT
     python -m src.cli block   --data DATA          (candidate recall on train, no training)
     python -m src.cli decide  --model artifacts/model --out OUTPUT   (re-decide from saved test scores)
+    python -m src.cli vocab   --data DATA --model artifacts/model   (add training-pool vocabulary tables to a bundle)
+    python -m src.cli configure --model artifacts/model --set NAME=JSON   (change a setting saved in a bundle)
 
 DATA is the dataset/ folder holding train/ and test/. `run` = train + predict.
 Exit codes: 0 success, 2 bad input or output data.
@@ -67,6 +69,30 @@ def _decide(args) -> None:
     _write(args, matches, cands, report)
 
 
+def _vocab(args) -> None:
+    """Save the training pool's vocabulary tables into a bundle trained without them."""
+    bundle = pipeline.Bundle.load(args.model)
+    pipeline.save_vocab(args.model, pipeline.train_vocab(args.data, bundle))
+    log.info("saved training-pool vocabulary tables to %s", args.model)
+
+
+def _configure(args) -> None:
+    """Set config fields in a saved bundle (models untouched), e.g. unseen_rules=true."""
+    path = args.model / pipeline.BUNDLE_FILE
+    if not path.is_file():
+        raise data.DataError(f"no model bundle at {args.model}")
+    meta = json.loads(path.read_text())
+    names = {f.name for f in dataclasses.fields(Config)}
+    for item in args.set:
+        name, value = item.split("=", 1)
+        if name not in names:
+            raise data.DataError(f"unknown setting {name!r}")
+        meta["config"][name] = json.loads(value)
+    Config.from_dict(meta["config"])
+    path.write_text(json.dumps(meta, indent=2))
+    log.info("bundle config now %s", meta["config"])
+
+
 def _write(args, matches, cands, report) -> None:
     data.write_id_lists(args.out / "matching_results.tsv", data.MATCH_COLUMN, matches)
     data.write_id_lists(args.out / "candidate_pairs.tsv", data.CANDIDATE_COLUMN, cands)
@@ -108,6 +134,13 @@ def main(argv=None) -> int:
             p.add_argument("--seed", type=int, default=d.seed)
             p.add_argument("--skip-country-check", action="store_true",
                            help="skip the leave-one-country-out estimate")
+    p = sub.add_parser("vocab")
+    p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
+    p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
+    p = sub.add_parser("configure")
+    p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
+    p.add_argument("--set", action="append", required=True, metavar="NAME=JSON",
+                   help='config field and JSON value, e.g. feature_caps=\'{"amb_s23_addr_2": 1}\' (repeatable)')
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -121,6 +154,10 @@ def main(argv=None) -> int:
             _decide(args)
         elif args.command == "predict":
             _predict(args)
+        elif args.command == "vocab":
+            _vocab(args)
+        elif args.command == "configure":
+            _configure(args)
         else:
             _predict(args, _train(args))
     except data.DataError as exc:

@@ -1,4 +1,6 @@
 """End-to-end and data-contract tests on a synthetic dataset (no network)."""
+import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -6,7 +8,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from src import cli, data, pipeline
+from src import alignment, cli, data, pipeline
 from src.config import Config
 from tests.synth import make_dataset
 
@@ -262,3 +264,34 @@ def test_predict_with_cap_changes_only_capped_country(dataset, trained, tmp_path
         a = base.filter(pl.col("source1_entity_id").is_in(sub.implode()))
         b = got.filter(pl.col("source1_entity_id").is_in(sub.implode()))
         assert a.equals(b) or may_change
+
+
+def test_vocab_command_rebuilds_the_training_tables(dataset, trained, tmp_path):
+    model_dir, _ = trained
+    saved = pipeline.Bundle.load(model_dir).vocab
+    assert set(saved) == set(alignment.VOCAB) and set(saved["floor"]["country_key"]) == {"us", "india"}
+    copy = tmp_path / "model"
+    shutil.copytree(model_dir, copy)
+    for k in alignment.VOCAB:
+        (copy / pipeline.VOCAB_FILE.format(k)).unlink()
+    assert pipeline.Bundle.load(copy).vocab is None
+    assert cli.main(["vocab", "--data", str(dataset), "--model", str(copy)]) == 0
+    rebuilt = pipeline.Bundle.load(copy).vocab
+    for k in alignment.VOCAB:
+        assert rebuilt[k].sort(rebuilt[k].columns).equals(saved[k].sort(saved[k].columns))
+
+
+def test_configure_pins_the_unseen_target_and_enables_unseen_rules(trained, tmp_path):
+    model_dir, _ = trained
+    copy = tmp_path / "model"
+    shutil.copytree(model_dir, copy)
+    assert cli.main(["configure", "--model", str(copy), "--set", "unseen_empty_target=0.5",
+                     "--set", "unseen_rules=true"]) == 0
+    bundle = pipeline.Bundle.load(copy)
+    assert bundle.config.unseen_empty_target == 0.5 and bundle.config.unseen_rules
+    assert cli.main(["decide", "--model", str(copy), "--out", str(tmp_path / "out")]) == 0
+    france = json.loads((copy / "predict_report.json").read_text())["unseen_country_calibration"]["france"]
+    assert {"legal_form_drops", "true_variant_adds", "tail_adds"} <= set(france)
+    if bundle.rule["kind"] == "expected_f05":
+        assert france["target"] == 0.5
+    assert cli.main(["configure", "--model", str(copy), "--set", "no_such_setting=1"]) == 2

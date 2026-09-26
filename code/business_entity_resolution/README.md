@@ -27,6 +27,9 @@ are needed at run time.
 
 This trains, validates, saves the model bundle to `artifacts/model/`, and writes
 `../../output/matching_results.tsv` and `../../output/candidate_pairs.tsv`.
+It uses the defaults in `src/config.py`, which save the training-pool vocabulary
+tables but leave the other predict-time corrections off (`feature_caps={}`,
+`unseen_rules=false`). The submitted outputs come from the v8 bundle below.
 
 The two stages can also run separately:
 
@@ -42,9 +45,11 @@ inputs and bundle give byte-identical outputs.
 ### The submitted bundle (v8)
 
 `artifacts/v8` is the trained v7 bundle with predict-time corrections and no
-retraining. It was made from `artifacts/v7` (models, dictionary, report) with:
+retraining. It was made from `artifacts/v7` (the bundle `train` saved for v7: models,
+dictionary, report) with:
 
 ```bash
+cp -R artifacts/v7 artifacts/v8
 .venv/bin/python -m src.cli vocab --data DATA --model artifacts/v8
 .venv/bin/python -m src.cli configure --model artifacts/v8 \
     --set 'feature_caps={"amb_s23_addr_2": 1.0}' --set 'feature_cap_countries=[]' \
@@ -63,6 +68,19 @@ retraining. It was made from `artifacts/v7` (models, dictionary, report) with:
   pinned so the corrections above do not move it.
 - `unseen_rules` turns on the post-decision rules of `src/unseen_rules.py` for
   countries absent from training.
+
+`artifacts/` is not in git, so the submission zip must carry the bundle. `predict`
+needs these files of `artifacts/v8/`: `bundle.json`, `native_words.json`, every
+`stage*_fold*.txt` (including `stage3_robust_fold*.txt`) and the three
+`vocab_*.parquet`. Leave out `oof.parquet` (error analysis only, 184 MB) and
+`test_scores/` (rewritten by `predict`, 1.2 GB). A bundle without the `vocab_*.parquet`
+files still loads but reads the leftover-token features at test-pool frequencies, so
+check the unzipped copy:
+
+```bash
+.venv/bin/python -c "from pathlib import Path; from src.pipeline import Bundle; \
+b = Bundle.load(Path('artifacts/v8')); assert b.vocab and b.config.unseen_rules; print('ok')"
+```
 
 Check the outputs with the challenge validator before uploading:
 

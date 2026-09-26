@@ -13,6 +13,7 @@ Scores are out-of-fold macro F0.5 on a sample of training Source 1 records
 | v7-stage2 | 4647c23 | v7 decided on stage-2 probabilities (drops stage 3, which adds sibling-supported US house variants on test) | same | holdout 0.9866 | |
 | v7-usdrop | 4647c23 | v7 + US decoy-copy-group drop rule (v7_lab/probe) | same | train-harmful by design; test probe | |
 | v7-final | (this commit) | v7, India decided on stage 3, US and France on stage 2 | 0.987 / 0.996 | holdout 0.9873 (India stage 3) / 0.9872 (US stage 2) | |
+| v8 | fb1725d | bundle = v7 + `vocab` tables + `configure` settings (amb_s23_addr_2 cap, training-pool token frequencies for US/India, pinned unseen empty-share target, unseen-country rules); no retraining. Reproduces stack/r4 except 4 France rows | same | not measured (test-pool corrections) | |
 
 Leave-one-country-out (v2, stage 1): trained on India, scored on US 0.944;
 trained on US, scored on India 0.864.

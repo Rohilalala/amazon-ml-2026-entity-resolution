@@ -5,12 +5,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
-from src import alignment, cli, data, pipeline
+from src import alignment, cli, data, pair_encoder, pipeline, stage4
 from src.config import Config
-from tests.synth import make_dataset
+from tests.synth import make_dataset, make_tiny_encoder
 
 VALIDATOR = Path(__file__).resolve().parents[3] / "student_resource" / "utils" / "validate_submission.py"
 
@@ -299,3 +300,73 @@ def test_configure_pins_the_unseen_target_and_enables_unseen_rules(trained, tmp_
     records = copy / "test_scores" / "records.parquet"
     pl.read_parquet(records).drop("name").write_parquet(records)  # scores saved before unseen_rules existed
     assert cli.main(["decide", "--model", str(copy), "--out", str(tmp_path / "out")]) == 2
+
+
+@pytest.fixture(scope="module")
+def stage4_model(dataset, trained, tmp_path_factory):
+    """The trained bundle plus stage 4 (a tiny encoder fine-tuned on CPU), predicted with
+    stage4_scope "all", then re-decided with "seen" and "none"."""
+    model_dir, _ = trained
+    copy, base, out = (tmp_path_factory.mktemp(n) for n in ("model4", "base", "out4"))
+    shutil.copytree(model_dir, copy, dirs_exist_ok=True)
+    raw = pl.concat([data.load_split(dataset, s) for s in ("train", "test")])
+    make_tiny_encoder(base, pair_encoder.texts(raw).to_list())
+    small = {**Config().ce_params, "train_s1": 60, "val_s1": 10, "batch_size": 16, "infer_batch": 64, "device": "cpu"}
+    assert cli.main(["configure", "--model", str(copy), "--set", "holdout_s1=20", "--set",
+                     f"ce_params={json.dumps(small)}", "--set", 'stage4_scope="all"']) == 0
+    assert cli.main(["stage4-train", "--data", str(dataset), "--model", str(copy), "--base", str(base)]) == 0
+    assert cli.main(["predict", "--data", str(dataset), "--model", str(copy), "--out", str(out / "all")]) == 0
+    for scope in ("seen", "none"):
+        assert cli.main(["decide", "--model", str(copy), "--out", str(out / scope), "--stage4-scope", scope]) == 0
+    return copy, out
+
+
+def test_stage4_train_saves_encoder_and_stacker(stage4_model):
+    model_dir, _ = stage4_model
+    bundle = pipeline.Bundle.load(model_dir)
+    assert bundle.stage4.features == stage4.FEATURES and bundle.stage4_rule["kind"] in {"threshold", "expected_f05"}
+    report = bundle.report["stage4"]
+    assert report["active_pairs"] > 0 and report["encoder"]["fit_pairs"] > 0 and 0 < report["oof_f05"] <= 1
+    assert (model_dir / pair_encoder.ENCODER_DIR / "model.safetensors").is_file()
+    records, pairs, probs = pipeline.load_scores(model_dir)
+    country = records["country_key"].to_numpy()[pairs["i"].to_numpy()]
+    active = pipeline.select_probability(probs, bundle, country) >= bundle.config.stage4_active
+    assert np.isfinite(pairs["ce_logit"].to_numpy()[active]).all() and np.isnan(pairs["ce_logit"].to_numpy()[~active]).all()
+
+
+def test_stage4_scope_decides_only_its_countries(dataset, stage4_model):
+    _, out = stage4_model
+    s1 = _read(dataset / "test" / "test_source1.tsv").select("entity_id", pl.col("country").str.to_lowercase())
+    rows = {k: _read(out / k / "matching_results.tsv").join(s1, left_on="source1_entity_id", right_on="entity_id")
+            for k in ("all", "seen", "none")}
+
+    def part(k, countries):
+        return rows[k].filter(pl.col("country").is_in(countries))
+    assert part("seen", ["us", "india"]).equals(part("all", ["us", "india"]))
+    assert part("seen", ["france"]).equals(part("none", ["france"]))
+
+
+@pytest.mark.skipif(not VALIDATOR.is_file(), reason="challenge validator not present")
+def test_stage4_output_passes_the_official_validator(dataset, stage4_model):
+    _, out = stage4_model
+    res = subprocess.run([sys.executable, str(VALIDATOR), "--matching", str(out / "all" / "matching_results.tsv"),
+                          "--candidate", str(out / "all" / "candidate_pairs.tsv"),
+                          "--test-dir", str(dataset / "test"), "--check-ids"], capture_output=True, text=True)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_stage4_import_copies_encoder_and_stacker(stage4_model, trained, tmp_path):
+    src, _ = stage4_model
+    model_dir, _ = trained
+    copy = tmp_path / "model"
+    shutil.copytree(model_dir, copy)
+    meta = tmp_path / "stage4.json"
+    rule = pipeline.Bundle.load(src).stage4_rule
+    meta.write_text(json.dumps({"features": stage4.FEATURES, "rule": rule}))
+    args = ["stage4-import", "--model", str(copy), "--encoder", str(src / pair_encoder.ENCODER_DIR),
+            "--stacker", str(src / pipeline.STAGE4_FILE), "--stacker-meta", str(meta)]
+    assert cli.main(args) == 0
+    bundle = pipeline.Bundle.load(copy)
+    assert bundle.stage4_rule == rule and (copy / pipeline.STAGE4_FILE).read_bytes() == (src / pipeline.STAGE4_FILE).read_bytes()
+    meta.write_text(json.dumps({"features": stage4.FEATURES[:-1], "rule": rule}))
+    assert cli.main(args) == 2

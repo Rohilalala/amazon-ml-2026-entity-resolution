@@ -102,3 +102,24 @@ def make_split(root: Path, split: str, countries, n_s1: int, seed: int) -> dict:
 def make_dataset(root: Path, n_s1: int = 400, seed: int = 7) -> None:
     make_split(root, "train", ["US", "India"], n_s1, seed)
     make_split(root, "test", ["US", "India", "France"], n_s1 // 2, seed + 1)
+
+
+def make_tiny_encoder(directory: Path, texts) -> None:
+    """A randomly initialised one-layer BERT pair classifier and a word-level tokenizer over
+    the words of `texts`, saved like a downloaded checkpoint (stands in for the real base
+    encoder in tests; no network)."""
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+    from transformers import BertConfig, BertForSequenceClassification, PreTrainedTokenizerFast
+    specials = ["[PAD]", "[UNK]", "[CLS]", "[SEP]"]
+    split = pre_tokenizers.Whitespace()
+    words = sorted({w for t in texts for w, _ in split.pre_tokenize_str(t)})
+    vocab = {w: k for k, w in enumerate(specials + words)}
+    tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+    tok.pre_tokenizer = split
+    tok.post_processor = processors.TemplateProcessing(
+        single="[CLS] $A [SEP]", pair="[CLS] $A [SEP] $B:1 [SEP]:1", special_tokens=[("[CLS]", 2), ("[SEP]", 3)])
+    PreTrainedTokenizerFast(tokenizer_object=tok, unk_token="[UNK]", pad_token="[PAD]", cls_token="[CLS]",
+                            sep_token="[SEP]").save_pretrained(directory)
+    cfg = BertConfig(vocab_size=len(vocab), hidden_size=16, num_hidden_layers=1, num_attention_heads=2,
+                     intermediate_size=32, max_position_embeddings=160, num_labels=1)
+    BertForSequenceClassification(cfg).save_pretrained(directory)

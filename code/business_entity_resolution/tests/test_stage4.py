@@ -1,5 +1,8 @@
 """Stage 4 pieces on small hand-made inputs: pair text, features, scope routing, decision, config."""
 import math
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,6 +19,13 @@ def test_pair_text_is_the_lowercased_raw_name_and_address():
                         "business_address": ["12 Rue X, Lyon", None, " 5 Main St "]})
     assert pair_encoder.texts(raw).to_list() == ["café lumière sarl | 12 rue x, lyon", "acme inc | ",
                                                  " | 5 main st"]
+
+
+def test_importing_the_pair_encoder_does_not_load_torch():
+    # torch's OpenMP runtime loaded before LightGBM's makes LightGBM segfault (macOS), so only
+    # the spawned encoder process may import torch.
+    code = "import sys; from src import pair_encoder, pipeline; sys.exit('torch' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1]).returncode == 0
 
 
 def test_empty_address_reads_the_text_after_the_first_bar():

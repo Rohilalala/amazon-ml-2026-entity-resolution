@@ -6,7 +6,9 @@ and legal forms kept; no normalisation, so an unseen country's text reaches the 
 Inference reads only the weights in the bundle's encoder/ folder, offline.
 
 Every torch step runs in a fresh process: on macOS torch and LightGBM each load their own
-OpenMP runtime, and torch's CPU kernels hang in a process where LightGBM has already run.
+OpenMP runtime, and torch's CPU kernels hang in a process where LightGBM has already run
+(loading torch first makes LightGBM segfault). So torch and transformers are imported only
+inside the functions that run in that process; importing this module never loads them.
 """
 import logging
 import math
@@ -16,12 +18,14 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
+# The settings the v9 run was verified with (the spawned process inherits them). The MPS
+# watermarks cap the Apple GPU allocator cache, so a blow-up raises instead of swapping.
+for _name, _value in (("HF_HUB_OFFLINE", "1"), ("TOKENIZERS_PARALLELISM", "true"),
+                      ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.7"), ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.6")):
+    os.environ.setdefault(_name, _value)
 
 import numpy as np
 import polars as pl
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 log = logging.getLogger(__name__)
 
@@ -44,8 +48,9 @@ def empty_address(text: pl.Series) -> np.ndarray:
     return (text.str.splitn(" | ", 2).struct.field("field_1").fill_null("").str.strip_chars() == "").to_numpy()
 
 
-def device(choice: str = "auto") -> tuple[torch.device, torch.dtype | None]:
+def device(choice: str = "auto") -> "tuple[torch.device, torch.dtype | None]":
     """Apple GPU, else CUDA, else CPU ("auto"), or "cpu"; bfloat16 autocast where supported."""
+    import torch
     if choice == "cpu":
         return torch.device("cpu"), None
     if torch.backends.mps.is_available():
@@ -55,7 +60,8 @@ def device(choice: str = "auto") -> tuple[torch.device, torch.dtype | None]:
     return torch.device("cpu"), None
 
 
-def _empty_cache(dev: torch.device) -> None:
+def _empty_cache(dev) -> None:
+    import torch
     if dev.type == "mps":
         torch.mps.empty_cache()
     elif dev.type == "cuda":
@@ -67,8 +73,9 @@ def _tokenize(tok, text: pl.Series, i: np.ndarray, j: np.ndarray, max_length: in
                max_length=max_length)["input_ids"]
 
 
-def _batch(ids: list[list[int]], rows: np.ndarray, pad_id: int, dev: torch.device) -> dict:
+def _batch(ids: list[list[int]], rows: np.ndarray, pad_id: int, dev) -> dict:
     """Padded input ids and attention mask for `rows` of `ids`."""
+    import torch
     lens = np.fromiter((len(ids[k]) for k in rows), np.int64, len(rows))
     width = int(math.ceil(lens.max() / PAD) * PAD)
     x = np.full((len(rows), width), pad_id, np.int64)
@@ -79,14 +86,14 @@ def _batch(ids: list[list[int]], rows: np.ndarray, pad_id: int, dev: torch.devic
     return {"input_ids": torch.from_numpy(x).to(dev), "attention_mask": torch.from_numpy(m).to(dev)}
 
 
-@torch.inference_mode()
 def _logits(model, ids: list[list[int]], pad_id: int, batch_size: int, dev, amp) -> np.ndarray:
     """Logits for tokenised pairs, run in length-sorted batches (stable sort, so deterministic)."""
+    import torch
     order = np.argsort(np.fromiter(map(len, ids), np.int64, len(ids)), kind="stable")
     out = np.empty(len(ids), np.float32)
     for b, s in enumerate(range(0, len(order), batch_size)):
         rows = order[s:s + batch_size]
-        with torch.autocast(dev.type, dtype=amp, enabled=amp is not None):
+        with torch.inference_mode(), torch.autocast(dev.type, dtype=amp, enabled=amp is not None):
             out[rows] = model(**_batch(ids, rows, pad_id, dev)).logits.squeeze(-1).float().cpu().numpy()
         if b % 20 == 19:
             _empty_cache(dev)
@@ -109,6 +116,7 @@ def score(model_dir: Path, text: pl.Series, i: np.ndarray, j: np.ndarray, params
 
 
 def _score(model_dir: Path, text: pl.Series, i: np.ndarray, j: np.ndarray, params: dict) -> np.ndarray:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
     dev, amp = device(params.get("device", "auto"))
     tok = AutoTokenizer.from_pretrained(model_dir)
     model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(dev).eval()
@@ -141,6 +149,8 @@ def train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: pl
 
 
 def _train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: pl.DataFrame, params: dict):
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
     dev, amp = device(params.get("device", "auto"))
     torch.manual_seed(params["seed"])
     tok = AutoTokenizer.from_pretrained(base)

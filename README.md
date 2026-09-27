@@ -20,17 +20,18 @@ Public leaderboard (macro F0.5), in the order the pieces were added:
 | 2-stage LightGBM matcher with house-number features | 0.964386 |
 | 3 stages, rarest-key blocking, France locale normalisation and empty-share calibration (v7) | 0.971137 |
 | + predict-time corrections for the test pool (ambiguity cap, training-pool vocabulary) | 0.974 |
-| + stage 4: fine-tuned pair encoder and stacker | 0.985 |
-| + dense recall adds | 0.986 |
+| + stage 4: fine-tuned pair encoder (v1) and stacker | 0.985 |
+| + encoder v2 and the 57-feature stacker | 0.985 |
+| + dense recall adds; then encoder v3 | 0.986 |
 | + France sister-organisation filter (strict, then v2) | 0.987, 0.988 |
 | + test-time adaptation of the encoder, round 1 | 0.989 |
-| + round 2, France tail-copy and different-street rules | 0.989538 |
-| + round 3, 57-feature stacker, France / India / US list rules | **0.989667** (final) |
+| + round 2, France 'groupe' tail-copy and different-street rules | 0.989538 |
+| + round 3, France / India / US list rules (steps F-H) | **0.989667** (final) |
 
 On 100,000 training Source 1 records held out from every model and scored exactly like the test
 set (US and India), the final stacker reaches macro F0.5 0.98959 (US 0.98995, India 0.98906); the
 v7 matcher alone reached 0.9873 there. The full log is in [docs/SUBMISSIONS.md](docs/SUBMISSIONS.md)
-and the method write-up in [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
+and the method write-up up to stage 4 in [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ## How it works
 
@@ -83,7 +84,7 @@ python3.12 -m venv .venv
 **Data.** The challenge data is not redistributed here. `DATA` below is the challenge `dataset/`
 folder (with `train/` and `test/`).
 
-**Model files.** `artifacts/` is not in git. The final bundle, `artifacts/final/` (1.5 GB), is
+**Model files.** `artifacts/` is not in git. The final bundle, `artifacts/final/` (1.6 GB), is
 distributed separately (with the submission zip); unpack it into `code/business_entity_resolution/`.
 It holds:
 
@@ -115,7 +116,7 @@ Without `--recall-pairs`, step B retrieves its new pairs itself (embeddings, kNN
 | encoders v2, v3 (continued fine-tuning on fresh records) | `encoder-train` |
 | test-time adaptation rounds 1-3 | `final` → `adapt-labels` → `adapt-train` → `stage4-train` (stacker only) |
 | recall head | `recall-train` |
-| post-decision lists | `src/rules.py` (code for E, F and G's sister rule; see below) |
+| post-decision lists | `src/rules.py` (code for E, F, G's sister and state rules, H's region rule; see below) |
 
 ## Hardware and timings
 
@@ -128,7 +129,7 @@ Measured on the final run with the prepared-record cache:
 | stages 1-3 over 47.2M pairs | 39 min | 10.3 GB |
 | pair encoder over 8.08M active pairs | 40 min | |
 | stage-4 stacker features and prediction | about 1 min | 5.8 GB |
-| recall encoder + head over 4.16M new pairs | see code README | |
+| recall encoder + head over 4.16M new pairs | 23 min | |
 | post-decision chain B-H | under 1 min | 8.2 GB |
 
 Retrieval without `--recall-pairs` embeds 11.7M records at about 8,700 records/s on the Apple GPU.
@@ -139,21 +140,25 @@ Retrieval without `--recall-pairs` embeds 11.7M records at about 8,700 records/s
   file (sha256 `0a76fb8fa921d23d8c3ec208849d740e5d1a531c573185229b1c7156b88c978c`). Each stage was
   checked against the files of the leaderboard run: stacker probabilities of all 8.08M active pairs,
   recall head probabilities, every step of the post-decision chain, the round-3 pseudo-labels, the
-  retriever embeddings and kNN lists, and five of the list rules on the decisions they were derived on.
+  retriever embeddings of a 200,000-record chunk, one kNN list (France Source 3), and eight of the
+  list rules on the decisions they were derived on.
 - **Apple GPU (MPS).** Encoder and retriever inference is deterministic run to run on the same
   machine with the same batch settings (checked bit for bit). CUDA or CPU arithmetic differs slightly
-  and can move a few decisions. GPU training is not bit-reproducible, so retrained encoders give
-  close but not identical logits.
+  and can move a few decisions. Whether GPU training is bit-reproducible was not measured; the
+  byte-identical path uses the saved round-3 weights.
 - **Recall pair list.** The retrieval rule caps reverse-only pairs at 10 per record by cosine; float16
-  cosines tie often, and the leaderboard run broke those ties in an order that varied run to run.
+  cosines tie often, and the leaderboard run ranked tied cosines in the row order of a join, which
+  is not fixed (the same ranking without a tie-break gave different lists on two runs of this code).
   The code breaks ties by source and record, so its list is deterministic; it differs from the
   leaderboard run's list in 368 of 4,156,489 pairs. `--recall-pairs` scores the leaderboard list
   instead, for a byte-identical result.
-- **Rule lists.** The leaderboard run derived each list of steps E-G on an earlier decision of the
+- **Rule lists.** The leaderboard run derived each list of steps E-H on an earlier decision of the
   same run and applied the fixed list later, so the lists ship as data (`lists.parquet`).
-  `src/rules.py` reproduces the France street, groupe tail-copy, cie/tailmid and sister2 lists exactly
-  on those decisions. The India pool-copy rule is code as well. Source-cap and US state-conflict drops,
-  France no-legal-form groupe adds, region conflicts and the near-tie ownership list ship as data only.
+  `src/rules.py` reproduces the France street, groupe tail-copy, cie/tailmid, sister2 and
+  region-conflict lists, the India pool-copy list and the US state-conflict list exactly on those
+  decisions. Source-cap drops, France no-legal-form groupe adds and the near-tie ownership list ship
+  as data only: their builders read intermediate tables of the leaderboard run, and the near-tie
+  list has no saved builder at all.
 
 ## Repository layout
 
@@ -161,7 +166,7 @@ Retrieval without `--recall-pairs` embeds 11.7M records at about 8,700 records/s
 README.md                         this file
 LICENSE                           MIT
 code/business_entity_resolution/  the pipeline: src/, tests/, requirements, README
-docs/METHODOLOGY.md               method write-up (submitted document)
+docs/METHODOLOGY.md               method write-up up to stage 4 (v9); later steps are in the READMEs
 docs/SUBMISSIONS.md               version and leaderboard log
 archive/                          archived experiment scripts (not runnable, kept for history)
 ```

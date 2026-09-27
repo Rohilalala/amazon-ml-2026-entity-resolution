@@ -156,8 +156,8 @@ The shipped weights came from the same recipe run as separate steps, with two
 differences: the learning-rate schedule also advanced with elapsed time (a 75-minute
 budget, which the pass finished inside), and 22,899 more fit pairs were dropped whose
 candidate appears in an active holdout pair (the holdout measured the gain: +0.00179,
-95% CI [0.00156, 0.00202], US and India). GPU training is not bit-reproducible, so a
-retrained encoder gives close but not identical logits.
+95% CI [0.00156, 0.00202], US and India). Whether GPU training is bit-reproducible was not
+measured, so expect a retrained encoder to give close, possibly not identical, logits.
 
 ### Files the submission zip needs
 
@@ -236,7 +236,7 @@ leaderboard run applied them:
 | E add | France last core word swapped for 'groupe' at the same address | 3,300 | `groupe_swap_adds` (exact) | same |
 | F add | France 'cie' written 'compagnie' | 628 | `cie_tailmid_adds` (exact) | round-2 final decision |
 | F add | France non-last word swapped for a final 'groupe' / 'france' | 1,306 | `cie_tailmid_adds` (exact) | same |
-| F add | India unscored pool copies of kept records (with their sources) | 140 | `india_copy_adds` | same |
+| F add | India unscored pool copies of kept records (with their sources) | 140 | `india_copy_adds` (exact, sources too) | same |
 | G drop | France sister swap at any position | 612 | `sister2_drops` (exact) | round-1 decision |
 | G drop | generator source-cap excess copies | 12 | data only | round-2 final decision |
 | G drop | US state conflicts | 13 | `us_state_conflict_drops` (exact) | day-1 US decision |
@@ -247,6 +247,19 @@ leaderboard run applied them:
 "Exact" means the function returns the shipped list when run on the decision named in the last
 column. Because each list was derived on an earlier decision, `rules.derive` (the same rules on the
 current frame) gives a slightly different chain; `final` replays the lists.
+
+Files the final bundle needs (about 1.6 GB; leave out `oof.parquet`, only used for training, and
+`test_scores/`, rewritten by every run): `bundle.json`, `native_words.json`, every `stage*_fold*.txt`,
+the three `vocab_*.parquet`, `encoder/`, `stage4_m0.txt` to `stage4_m2.txt`, `lists.parquet` and
+`recall/` (`retriever/`, `encoder/`, `head.txt`, `head.json`, `new_pairs_leaderboard.parquet`).
+Check an unzipped copy:
+
+```bash
+.venv/bin/python -c "from pathlib import Path; from src.pipeline import Bundle; d = Path('artifacts/final'); \
+b = Bundle.load(d); assert b.config.stage4_scope == 'all' and len(b.stage4.boosters) == 3 and len(b.stage4.features) == 57; \
+assert all((d / p).is_file() for p in ('encoder/model.safetensors', 'lists.parquet', 'recall/head.txt', 'recall/head.json', \
+'recall/retriever/model.safetensors', 'recall/encoder/model.safetensors', 'recall/new_pairs_leaderboard.parquet')); print('ok')"
+```
 
 ### Training the final models
 
@@ -303,9 +316,9 @@ Differences between these commands and the runs that made the shipped files: v1 
 learning-rate schedule that also advanced with elapsed time (75-minute budget); their training
 pairs also excluded candidates of active holdout pairs, and v1's records came from a separate
 draw (top 8 candidates per record, fit filter rank <= 6 or true). Round 3's decision (the round-2
-final file) included 393 pairs restored by hand that no saved script reproduces; given the leaderboard
-run's own files, `adapt-labels` reproduces round 3's pseudo-labels and anchors exactly. GPU training
-itself is not bit-reproducible.
+final file) included 393 pairs restored by a step that no saved script reproduces; given the leaderboard
+run's own files, `adapt-labels` reproduces round 3's pseudo-labels and anchors exactly. Whether GPU
+training is bit-reproducible was not measured.
 
 ## Pipeline
 

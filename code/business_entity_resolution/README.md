@@ -285,7 +285,8 @@ are listed after it. `DATA` is the dataset folder, `CACHE` a cache folder.
    hard = per Source 1 record the 2 unkept candidates with the highest encoder logit among those
    <= 0.05; easy = other pairs <= 0.02; sister = pairs a post-decision filter removed (label 0).
    55% pos / 22.5% hard / 22.5% easy per country, 10% of the sampled records held out; anchors are
-   labelled training pairs from the encoder's fit set. Round settings (`adapt.ROUNDS`):
+   labelled training pairs from the encoder's fit set (`fit_pairs.parquet`, written by `encoder-train`).
+   Round settings (`adapt.ROUNDS`):
 
    | Round | Pseudo pairs | Anchors | France share | Seed | Negatives |
    |---|---|---|---|---|---|

@@ -840,7 +840,8 @@ def train_encoder(data_dir: Path, bundle_dir: Path, init: Path, out_dir: Path, l
     validation AUC. Each record brings its top 8 candidates by retrieval score plus every true pair
     among its candidates; fit pairs are those of rank <= 6 or true, minus pairs whose candidate
     belongs to an active pair of the matcher's sample. One pass (pair_encoder.train) at `lr`.
-    The records drawn are saved to <out_dir>/s1_draw.parquet for the next round's `exclude`."""
+    The records drawn are saved to <out_dir>/s1_draw.parquet for the next round's `exclude`, the
+    fit pairs to fit_pairs.parquet (the anchor pool of test-time adaptation)."""
     bundle = Bundle.load(bundle_dir)
     cfg, params = bundle.config, bundle.config.ce_params
     raw = data.load_split(data_dir, "train")
@@ -874,6 +875,9 @@ def train_encoder(data_dir: Path, bundle_dir: Path, init: Path, out_dir: Path, l
     report = pair_encoder.train(init, out_dir, pair_text, fit, P.filter(is_val & fits).select("i", "j", "y"),
                                 {**params, "lr": lr})
     fresh.select(pl.col("row").alias("i"), is_val=pl.col("row").is_in(val.implode())).write_parquet(out_dir / "s1_draw.parquet")
+    # the anchor pool of test-time adaptation (adapt-labels --anchor-pool)
+    fit.join(fresh.select(pl.col("row").alias("i"), pl.col("country_key").alias("country")), on="i", how="left",
+             maintain_order="left").write_parquet(out_dir / "fit_pairs.parquet")
     report.update(init=str(init.name), lr=lr, fresh_s1=fresh.height, val_s1=val.len())
     (out_dir / "encoder_report.json").write_text(json.dumps(report, indent=2))
     return report

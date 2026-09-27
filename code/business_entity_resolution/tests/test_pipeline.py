@@ -450,6 +450,7 @@ def test_encoder_and_recall_head_training(dataset, final_model, tmp_path):
     assert cli.main([*args, "--out", str(enc2), "--exclude", str(enc1)]) == 0
     d1, d2 = (pl.read_parquet(d / "s1_draw.parquet")["i"] for d in (enc1, enc2))
     assert d1.len() == 30 and not d2.is_in(d1.implode()).any() and (enc2 / "model.safetensors").is_file()
+    assert pl.read_parquet(enc1 / "fit_pairs.parquet").columns == ["i", "j", "y", "country"]
     assert cli.main(["recall-train", "--data", str(dataset), "--model", str(copy)]) == 0
     meta = json.loads((copy / final.RECALL_DIR / "head.json").read_text())
     assert meta["t_keep"] in [round(x, 2) for x in np.arange(0.20, 0.96, 0.05)] + [0.97, 0.98, 0.99, 1.01]

@@ -106,6 +106,14 @@ def test_groupe_swap_and_street_drops_on_a_frame():
     assert rules.groupe_swap_adds(sub_of({"S1-1": [], "S1-2": ["S2-1"]}), prep, cand).height == 0  # j claimed
 
 
+def test_us_state_conflict():
+    raw = pl.DataFrame([("S1-1", "Acme", "5 main st, austin, TX 73301", "US", 1), ("S2-1", "Acme", "5 main st, austin, CA", "US", 2),
+                        ("S2-2", "Acme", "5 main st, austin, TX", "US", 2), ("S3-1", "Acme", "5 main st", "US", 3)],
+                       schema=["entity_id", "business_name", "business_address", "country", "src"], orient="row")
+    sub = sub_of({"S1-1": ["S2-1", "S2-2", "S3-1"]})
+    assert rules.us_state_conflict_drops(sub, _prep(raw)).rows() == [("S1-1", "S2-1")]
+
+
 def test_india_copy_adds_need_an_unscored_unclaimed_copy():
     raw = pl.DataFrame([("S1-1", "Ram Traders", "5 mg road", "India", 1), ("S2-1", "Ram Traders", "5 mg road", "India", 2),
                         ("S3-1", "Ram Traders", "5 mg road", "India", 3), ("S3-2", "Ram Traders", "", "India", 3)],

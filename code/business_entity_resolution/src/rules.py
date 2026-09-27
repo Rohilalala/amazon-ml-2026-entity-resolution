@@ -16,9 +16,10 @@ lists.parquet by default; `derive` recomputes the lists on the current frame ins
                                address as a kept record (a pool copy), with its source records.
   G drops  sister2_drops       France: a sister-organisation word swap at any position (the step C
                                rule without its position constraint).
+  G drops  us_state_conflict_drops  US: the two addresses carry different state codes.
   H drops  region_conflict_drops  France: the two addresses name (or have cities in) different regions.
-Lists without code here (lists.parquet only, see README): G source-cap drops, US state-conflict
-drops and France no-legal-form groupe adds; H near-tie ownership abstention.
+Lists without code here (lists.parquet only, see README): G source-cap drops and France
+no-legal-form groupe adds; H near-tie ownership abstention.
 """
 import collections
 import difflib
@@ -277,6 +278,22 @@ def with_sources(adds: pl.DataFrame, sub: pl.DataFrame, prep: pl.DataFrame) -> p
     return adds.join(S, on=["s1", "m"], how="left", maintain_order="left")
 
 
+US_STATES = set("al ak az ar ca co ct de fl ga hi id il in ia ks ky la me md ma mi mn ms mo mt ne nv nh nj nm ny nc nd oh ok "
+                "or pa ri sc sd tn tx ut vt va wa wv wi wy dc pr".split())
+
+
+def us_state_conflict_drops(sub: pl.DataFrame, prep: pl.DataFrame) -> pl.DataFrame:
+    """G drops (stateconf): US kept pairs whose two prepared addresses both carry state codes and
+    share none."""
+    us = prep.filter(pl.col("country_key") == "us")
+    k = (_kept_rows(sub, us.select("row", "entity_id"))
+         .join(us.select(pl.col("row").alias("i"), ai="addr"), on="i").join(us.select(pl.col("row").alias("j"), aj="addr"), on="j"))
+    hit = [bool(si and sj and not (si & sj)) for si, sj in
+           (({w for w in (a or "").split() if w in US_STATES}, {w for w in (b or "").split() if w in US_STATES})
+            for a, b in zip(k["ai"].to_list(), k["aj"].to_list()))]
+    return _ids(prep, k.filter(pl.Series(hit, dtype=pl.Boolean)).select("i", "j")).select("s1", "m")
+
+
 # France regions named in addresses (as region or department) and the cities of the test pool that imply one.
 REGIONS = {"nouvelle aquitaine": "NA", "gironde": "NA", "hauts de france": "HF", "nord": "HF", "pas de calais": "HF",
            "pays de la loire": "PL", "loire atlantique": "PL"}
@@ -333,8 +350,9 @@ def derive(step: str, sub: pl.DataFrame, recs: postprocess.TestRecords, prep: pl
         adds = pl.concat([cie_tailmid_adds(sub, prep, active).select("s1", "m"), copies.select("s1", "m")])
         return empty, adds, copies.filter(pl.col("src").is_not_null())
     if step == "G":
-        rest = shipped["G", "drop"].filter(pl.col("rule") != "sister2").select("s1", "m")
-        return pl.concat([sister2_drops(sub, recs), rest]), shipped["G", "add"].select("s1", "m"), None
+        rest = shipped["G", "drop"].filter(~pl.col("rule").is_in(["sister2", "stateconf"])).select("s1", "m")
+        return (pl.concat([sister2_drops(sub, recs), us_state_conflict_drops(sub, prep), rest]),
+                shipped["G", "add"].select("s1", "m"), None)
     if step == "H":
         rest = shipped["H", "drop"].filter(pl.col("rule") != "fr_region_conflict").select("s1", "m")
         return pl.concat([region_conflict_drops(sub, recs), rest]), shipped["H", "add"].select("s1", "m"), None

@@ -371,3 +371,76 @@ def test_stage4_import_copies_encoder_and_stacker(stage4_model, trained, tmp_pat
     assert str(src) not in (copy / pipeline.BUNDLE_FILE).read_text()  # file names only, no local paths
     meta.write_text(json.dumps({"features": stage4.FEATURES[:-1], "rule": rule}))
     assert cli.main(args) == 2
+
+
+@pytest.fixture(scope="module")
+def final_model(dataset, trained, tmp_path_factory):
+    """The trained bundle with an ACNRST stage 4 (two seed members, tiny encoder), the recall
+    pieces (tiny encoders, a small head) and one list row, run through `final`."""
+    import lightgbm as lgb
+    from src import final, recall
+    model_dir, _ = trained
+    copy, base, out = (tmp_path_factory.mktemp(n) for n in ("model_final", "base_final", "out_final"))
+    shutil.copytree(model_dir, copy, dirs_exist_ok=True)
+    raw = pl.concat([data.load_split(dataset, s) for s in ("train", "test")])
+    make_tiny_encoder(base, pair_encoder.texts(raw).to_list())
+    small = {**Config().ce_params, "train_s1": 60, "val_s1": 10, "batch_size": 16, "infer_batch": 64, "device": "cpu"}
+    assert cli.main(["configure", "--model", str(copy), "--set", "holdout_s1=20", "--set", f"ce_params={json.dumps(small)}",
+                     "--set", 'stage4_scope="all"', "--set", 'stage4_features="ACNRST"', "--set", "stage4_seeds=[1, 2]"]) == 0
+    assert cli.main(["stage4-train", "--data", str(dataset), "--model", str(copy), "--base", str(base)]) == 0
+    rng = np.random.default_rng(0)
+    x = rng.random((400, len(recall.HEAD_FEATURES)))
+    head = tmp_path_factory.mktemp("head")
+    lgb.train({"objective": "binary", "verbose": -1}, lgb.Dataset(x, (x[:, 0] > 0.3).astype(int)), 5).save_model(head / "head.txt")
+    (head / "head.json").write_text(json.dumps({"features": recall.HEAD_FEATURES, "t_keep": 0.8, "t_none": 0.75}))
+    s1 = data.load_split(dataset, "test").filter(pl.col("src") == 1)["entity_id"][0]
+    pl.DataFrame({"step": ["H"], "action": ["drop"], "rule": ["example"], "s1": [s1], "m": ["S2-99999"]},
+                 schema_overrides={"src": pl.List(pl.String)}).with_columns(pl.lit(None, pl.List(pl.String)).alias("src")) \
+        .write_parquet(head / "lists.parquet")
+    assert cli.main(["post-import", "--model", str(copy), "--retriever", str(base), "--recall-encoder", str(base),
+                     "--head", str(head / "head.txt"), "--head-meta", str(head / "head.json"),
+                     "--lists", str(head / "lists.parquet")]) == 0
+    assert cli.main(["final", "--data", str(dataset), "--model", str(copy), "--out", str(out / "a")]) == 0
+    return copy, out, final
+
+
+def test_final_stage4_members_and_outputs(dataset, final_model):
+    model_dir, out, _ = final_model
+    bundle = pipeline.Bundle.load(model_dir)
+    assert bundle.stage4.features == stage4.FEATURE_SETS["ACNRST"] and len(bundle.stage4.boosters) == 2
+    assert bundle.report["stage4"]["seeds"] == [1, 2] and len(bundle.report["stage4"]["fold_rounds"]) == 2
+    report = json.loads((model_dir / "predict_report.json").read_text())
+    assert set(report["post"]) == {"B_recall", "C_sister", "D_restore", "E_lists", "F_lists", "G_lists", "H_lists"}
+    assert report["post"]["B_recall"]["new_pairs"] > 0
+    if VALIDATOR.is_file():
+        res = subprocess.run([sys.executable, str(VALIDATOR), "--matching", str(out / "a" / "matching_results.tsv"),
+                              "--candidate", str(out / "a" / "candidate_pairs.tsv"), "--test-dir", str(dataset / "test"),
+                              "--check-ids"], capture_output=True, text=True)
+        assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_final_with_a_saved_recall_list_matches(dataset, final_model):
+    model_dir, out, final = final_model
+    cached = model_dir / "test_scores" / "recall_pairs.parquet"
+    fixed = out / "recall_pairs.parquet"
+    pl.read_parquet(cached).drop("prob").write_parquet(fixed)
+    cached.unlink()
+    assert cli.main(["final", "--data", str(dataset), "--model", str(model_dir), "--out", str(out / "b"),
+                     "--recall-pairs", str(fixed)]) == 0
+    for f in ("matching_results.tsv", "candidate_pairs.tsv"):
+        assert (out / "a" / f).read_bytes() == (out / "b" / f).read_bytes()
+
+
+def test_encoder_and_recall_head_training(dataset, final_model, tmp_path):
+    model_dir, _, final = final_model
+    copy = tmp_path / "model"
+    shutil.copytree(model_dir, copy, ignore=shutil.ignore_patterns("test_scores"))
+    enc1, enc2 = tmp_path / "enc1", tmp_path / "enc2"
+    args = ["encoder-train", "--data", str(dataset), "--model", str(copy), "--init", str(copy / pair_encoder.ENCODER_DIR)]
+    assert cli.main([*args, "--out", str(enc1), "--draw", "30"]) == 0
+    assert cli.main([*args, "--out", str(enc2), "--exclude", str(enc1)]) == 0
+    d1, d2 = (pl.read_parquet(d / "s1_draw.parquet")["i"] for d in (enc1, enc2))
+    assert d1.len() == 30 and not d2.is_in(d1.implode()).any() and (enc2 / "model.safetensors").is_file()
+    assert cli.main(["recall-train", "--data", str(dataset), "--model", str(copy)]) == 0
+    meta = json.loads((copy / final.RECALL_DIR / "head.json").read_text())
+    assert meta["t_keep"] in [round(x, 2) for x in np.arange(0.20, 0.96, 0.05)] + [0.97, 0.98, 0.99, 1.01]

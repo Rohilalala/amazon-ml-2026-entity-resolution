@@ -8,7 +8,13 @@
     python -m src.cli vocab   --data DATA --model artifacts/model   (add training-pool vocabulary tables to a bundle)
     python -m src.cli configure --model artifacts/model --set NAME=JSON   (change a setting saved in a bundle)
     python -m src.cli stage4-train  --data DATA --model artifacts/model --base BASE   (fine-tune + stack stage 4)
-    python -m src.cli stage4-import --model artifacts/model --encoder DIR --stacker FILE.txt --stacker-meta FILE.json
+    python -m src.cli stage4-import --model artifacts/model --encoder DIR --stacker FILE.txt [--stacker ...] --stacker-meta FILE.json
+    python -m src.cli post-import --model artifacts/final --retriever DIR --recall-encoder DIR --head FILE --head-meta FILE --lists FILE
+    python -m src.cli final   --data DATA --model artifacts/final --out OUTPUT   (the leaderboard run)
+    python -m src.cli encoder-train --data DATA --model BUNDLE --init DIR --out DIR [--draw N --exclude DIR]
+    python -m src.cli recall-train  --data DATA --model artifacts/final
+    python -m src.cli adapt-labels --data DATA --model BUNDLE --decision TSV --anchor-pool FILE --round N --out DIR
+    python -m src.cli adapt-train  --data DATA --model BUNDLE --init DIR --labels DIR --out DIR
 
 DATA is the dataset/ folder holding train/ and test/. `run` = train + predict.
 Exit codes: 0 success, 2 bad input or output data.
@@ -17,13 +23,15 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
 
 import lightgbm as lgb
+import polars as pl
 
-from . import data, pair_encoder, pipeline, stage4
+from . import adapt, data, final, pair_encoder, pipeline, postprocess, recall, stage4
 from .config import Config
 
 log = logging.getLogger("ber")
@@ -77,22 +85,101 @@ def _decide(args) -> None:
 
 
 def _stage4_import(args) -> None:
-    """Put an already fine-tuned encoder and a trained stage-4 stacker into a bundle."""
-    pipeline.Bundle.load(args.model)  # the bundle must exist
+    """Put an already fine-tuned encoder and trained stage-4 stacker members into a bundle
+    (replacing any stage 4 it had)."""
+    if not (args.model / pipeline.BUNDLE_FILE).is_file():
+        raise data.DataError(f"no model bundle at {args.model}")
     meta = json.loads(args.stacker_meta.read_text())
-    if meta.get("features") != stage4.FEATURES or lgb.Booster(model_file=str(args.stacker)).num_feature() != len(stage4.FEATURES):
-        raise data.DataError(f"{args.stacker}: stacker features are not {stage4.FEATURES}")
+    names = meta.get("features")
+    stage4.feature_set(names or [])  # a known feature set
+    for f in args.stacker:
+        if lgb.Booster(model_file=str(f)).num_feature() != len(names):
+            raise data.DataError(f"{f}: stacker features are not the {len(names)} of {args.stacker_meta}")
     if not (args.encoder / "model.safetensors").is_file():
         raise data.DataError(f"no model.safetensors in {args.encoder}")
     shutil.copytree(args.encoder, args.model / pair_encoder.ENCODER_DIR, dirs_exist_ok=True)
-    shutil.copyfile(args.stacker, args.model / pipeline.STAGE4_FILE)
+    os.chmod(args.model / pair_encoder.ENCODER_DIR / "model.safetensors", 0o644)
+    files = pipeline.stage4_files(len(args.stacker))
+    for f, name in zip(args.stacker, files):
+        shutil.copyfile(f, args.model / name)
     pipeline.set_stage4_meta(args.model, meta["rule"], {
-        "imported": {"encoder": args.encoder.name, "stacker": args.stacker.name, "rounds": meta.get("rounds"),
-                     "encoder_sha256": pipeline._sha256(args.encoder / "model.safetensors"),
-                     "stacker_sha256": pipeline._sha256(args.stacker)}})
+        "imported": {"encoder": args.encoder.name, "stacker": [f.name for f in args.stacker], "rounds": meta.get("rounds"),
+                     "seeds": meta.get("seeds"), "encoder_sha256": pipeline._sha256(args.encoder / "model.safetensors"),
+                     "stacker_sha256": [pipeline._sha256(f) for f in args.stacker]}}, names, files)
     bundle = pipeline.Bundle.load(args.model)
-    log.info("stage 4 imported into %s: %d trees, rule %s", args.model, bundle.stage4.boosters[0].num_trees(),
-             bundle.stage4_rule)
+    log.info("stage 4 imported into %s: %d member(s), %d features, rule %s", args.model, len(bundle.stage4.boosters),
+             len(names), bundle.stage4_rule)
+
+
+def _post_import(args) -> None:
+    """Put the recall models (pretrained retriever, recall pair encoder, head) and the rule lists
+    of the post-decision chain into a bundle."""
+    pipeline.Bundle.load(args.model)
+    rdir = args.model / final.RECALL_DIR
+    meta = json.loads(args.head_meta.read_text())
+    if meta.get("features") != recall.HEAD_FEATURES:
+        raise data.DataError(f"{args.head_meta}: head features are not {recall.HEAD_FEATURES}")
+    for name, src in ((recall.RETRIEVER_DIR, args.retriever), (recall.ENCODER_DIR, args.recall_encoder)):
+        if not (src / "model.safetensors").is_file():
+            raise data.DataError(f"no model.safetensors in {src}")
+        shutil.copytree(src, rdir / name, dirs_exist_ok=True)
+        os.chmod(rdir / name / "model.safetensors", 0o644)
+    shutil.copyfile(args.head, rdir / recall.HEAD_FILE)
+    (rdir / recall.HEAD_META).write_text(json.dumps(meta, indent=1))
+    lists = pl.read_parquet(args.lists)
+    if lists.columns != ["step", "action", "rule", "s1", "m", "src"]:
+        raise data.DataError(f"{args.lists}: columns must be step, action, rule, s1, m, src")
+    shutil.copyfile(args.lists, args.model / final.LISTS_FILE)
+    log.info("post-decision pieces imported into %s: head t_keep %s t_none %s, %d list rows", args.model,
+             meta["t_keep"], meta["t_none"], lists.height)
+
+
+def _final(args) -> None:
+    """The leaderboard run: stages 1-4, recall adds and the post-decision chain."""
+    matches, cands, report = final.predict(args.data, args.model, cache=args.cache, fixed_recall=args.recall_pairs)
+    _write(args, matches, cands, report)
+
+
+def _adapt_labels(args) -> None:
+    """Pseudo-labels and anchors of one test-time adaptation round, from the previous round's run."""
+    bundle = pipeline.Bundle.load(args.model)
+    records, pairs, probs = pipeline.load_scores(args.model)
+    country = records["country_key"].to_numpy()[pairs["i"].to_numpy()]
+    prob = pipeline.select_probability(probs, bundle, country)
+    act = prob >= bundle.config.stage4_active
+    i, j, ce = pairs["i"].to_numpy(), pairs["j"].to_numpy(), pairs["ce_logit"].to_numpy()
+    p4 = stage4.probability(bundle.stage4, i, j, prob, ce, records["addr_empty"].to_numpy(), act, records)
+    T = pl.DataFrame({"i": i[act], "j": j[act], "country": country[act], "p4": p4[act], "ce": ce[act]})
+    raw = data.load_split(args.data, "test")
+    recs = postprocess.TestRecords(raw.select("entity_id", "src", "country", "business_name", "business_address"))
+    ids = records.select("row", "entity_id")
+
+    def read(path):
+        return postprocess.pairs(data.read_tsv(path, ["source1_entity_id", data.MATCH_COLUMN]))
+    decision = read(args.decision)
+    neg = None
+    if args.negatives_from:
+        pre = [read(a).join(read(b), on=["s1", "m"], how="anti") if b else read(a)
+               for a, _, b in (x.partition(":") for x in args.negatives_from)]
+        neg = adapt.to_rows(adapt.negatives_of([pl.DataFrame({"s1": q["s1"], "m": q["m"]}) for q in pre], decision,
+                                               recs, args.drop_scrambles), ids)
+    fit = pl.read_parquet(args.anchor_pool)
+    S, A = adapt.build(T, adapt.to_rows(decision, ids), neg, fit, adapt.ROUNDS[args.round])
+    args.out.mkdir(parents=True, exist_ok=True)
+    S.write_parquet(args.out / "pseudo.parquet")
+    A.write_parquet(args.out / "anchor.parquet")
+    log.info("round %d: %d pseudo pairs (%d held out), %d anchors -> %s", args.round, S.height, int(S["is_ho"].sum()),
+             A.height, args.out)
+
+
+def _adapt_train(args) -> None:
+    """Fine-tune the pair encoder on one round's pseudo-labels and anchors."""
+    bundle = pipeline.Bundle.load(args.model)
+    text_train = pair_encoder.texts(data.load_split(args.data, "train"))
+    text_test = pair_encoder.texts(data.load_split(args.data, "test"))
+    report = adapt.train(args.init, args.out, text_train, text_test, pl.read_parquet(args.labels / "anchor.parquet"),
+                         pl.read_parquet(args.labels / "pseudo.parquet"), bundle.config.ce_params)
+    (args.out / "adapt_report.json").write_text(json.dumps(report, indent=2))
 
 
 def _vocab(args) -> None:
@@ -173,13 +260,61 @@ def main(argv=None) -> int:
     p = sub.add_parser("stage4-train")
     p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
     p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder (with oof.parquet)")
-    p.add_argument("--base", type=Path, required=True, help="local copy of the base encoder checkpoint")
+    p.add_argument("--base", type=Path, default=None,
+                   help="encoder checkpoint to fine-tune from; omit to keep the bundle's encoder/ and train the stacker only")
     p.add_argument("--cache", type=Path, default=None, help="reuse the prepared training records and candidates")
     p = sub.add_parser("stage4-import")
     p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
     p.add_argument("--encoder", type=Path, required=True, help="fine-tuned encoder folder (weights + tokenizer)")
-    p.add_argument("--stacker", type=Path, required=True, help="stage-4 LightGBM model file")
+    p.add_argument("--stacker", type=Path, action="append", required=True,
+                   help="stage-4 LightGBM model file (repeat for seed members, averaged)")
     p.add_argument("--stacker-meta", type=Path, required=True, help="JSON with its features and decision rule")
+    p = sub.add_parser("post-import")
+    p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
+    p.add_argument("--retriever", type=Path, required=True, help="pretrained multilingual-e5-small folder")
+    p.add_argument("--recall-encoder", type=Path, required=True, help="pair encoder that scores the recall pairs")
+    p.add_argument("--head", type=Path, required=True, help="recall head LightGBM model file")
+    p.add_argument("--head-meta", type=Path, required=True, help="JSON with its features and thresholds")
+    p.add_argument("--lists", type=Path, required=True, help="lists.parquet of the post-decision steps E-H")
+    p = sub.add_parser("final")
+    p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
+    p.add_argument("--model", type=Path, default=Path("artifacts/final"), help="final bundle folder")
+    p.add_argument("--out", type=Path, required=True, help="output folder for the TSVs")
+    p.add_argument("--cache", type=Path, default=None, help="reuse prepared records and candidates across runs")
+    p.add_argument("--recall-pairs", type=Path, default=None,
+                   help="score this saved recall new-pair list instead of retrieving (byte-exact leaderboard run)")
+    p = sub.add_parser("encoder-train")
+    p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
+    p.add_argument("--model", type=Path, required=True, help="bundle (oof.parquet, ce_params)")
+    p.add_argument("--init", type=Path, required=True, help="encoder to continue from")
+    p.add_argument("--out", type=Path, required=True, help="new encoder folder")
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--draw", type=int, default=0, help="fresh Source 1 records to draw (0 = all remaining)")
+    p.add_argument("--exclude", type=Path, action="append", default=[], help="earlier encoder folder whose draw to skip")
+    p.add_argument("--seed", type=int, default=21)
+    p.add_argument("--cache", type=Path, default=None)
+    p = sub.add_parser("recall-train")
+    p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
+    p.add_argument("--model", type=Path, required=True, help="bundle with recall/retriever and recall/encoder")
+    p.add_argument("--head-s1", type=int, default=200_000, help="training Source 1 records the head learns from")
+    p.add_argument("--cache", type=Path, default=None)
+    p = sub.add_parser("adapt-labels")
+    p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
+    p.add_argument("--model", type=Path, required=True, help="previous round's bundle, after `final` (its test_scores)")
+    p.add_argument("--decision", type=Path, required=True, help="previous round's final matching_results.tsv")
+    p.add_argument("--negatives-from", action="append", default=None, metavar="BEFORE[:AFTER]",
+                   help="matching_results.tsv kept before a filter (minus AFTER when given); its pairs outside the "
+                        "decision become negatives (repeatable)")
+    p.add_argument("--drop-scrambles", action="store_true", help="keep generator typo scrambles out of the negatives")
+    p.add_argument("--anchor-pool", type=Path, required=True, help="parquet (i, j, y, country) of labelled training pairs")
+    p.add_argument("--round", type=int, choices=sorted(adapt.ROUNDS), required=True)
+    p.add_argument("--out", type=Path, required=True)
+    p = sub.add_parser("adapt-train")
+    p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
+    p.add_argument("--model", type=Path, required=True, help="bundle whose ce_params apply")
+    p.add_argument("--init", type=Path, required=True, help="encoder the round starts from")
+    p.add_argument("--labels", type=Path, required=True, help="adapt-labels output folder")
+    p.add_argument("--out", type=Path, required=True, help="adapted encoder folder")
     p = sub.add_parser("configure")
     p.add_argument("--model", type=Path, default=Path("artifacts/model"), help="bundle folder")
     p.add_argument("--set", action="append", required=True, metavar="NAME=JSON",
@@ -205,6 +340,19 @@ def main(argv=None) -> int:
             pipeline.train_stage4(args.data, args.model, args.base, cache=args.cache)
         elif args.command == "stage4-import":
             _stage4_import(args)
+        elif args.command == "post-import":
+            _post_import(args)
+        elif args.command == "final":
+            _final(args)
+        elif args.command == "encoder-train":
+            pipeline.train_encoder(args.data, args.model, args.init, args.out, args.lr, args.draw, args.exclude, args.seed,
+                                   cache=args.cache)
+        elif args.command == "recall-train":
+            final.train_recall_head(args.data, args.model, n_head=args.head_s1, cache=args.cache)
+        elif args.command == "adapt-labels":
+            _adapt_labels(args)
+        elif args.command == "adapt-train":
+            _adapt_train(args)
         else:
             _predict(args, _train(args))
     except data.DataError as exc:

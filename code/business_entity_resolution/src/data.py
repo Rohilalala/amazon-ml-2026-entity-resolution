@@ -119,6 +119,18 @@ def check_submission(ids: pl.Series, matches: pl.DataFrame, candidates: pl.DataF
         raise DataError("submission check failed: " + "; ".join(problems))
 
 
+def check_files(data_dir: Path, out_dir: Path) -> None:
+    """check_submission on the matching_results.tsv and candidate_pairs.tsv in `out_dir`, against
+    the test split of `data_dir`. Besides the validator's rules it checks that every matched id is
+    also a candidate of the same row, which the official validator does not check."""
+    raw = load_split(data_dir, "test")
+    frames = [read_tsv(out_dir / name, ["source1_entity_id", col]).select(pl.col("source1_entity_id").alias("s1"),
+                                                                          pl.col(col).alias("id"))
+              for name, col in (("matching_results.tsv", MATCH_COLUMN), ("candidate_pairs.tsv", CANDIDATE_COLUMN))]
+    check_submission(raw.filter(pl.col("src") == 1)["entity_id"], *frames,
+                     set(raw.filter(pl.col("src") != 1)["entity_id"].to_list()))
+
+
 def write_id_lists(path: Path, column: str, frame: pl.DataFrame) -> None:
     """Write `source1_entity_id<TAB>column` rows. Written to a temp file and
     renamed, so a crash never leaves a partial file."""

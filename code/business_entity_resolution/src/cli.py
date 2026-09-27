@@ -11,6 +11,7 @@
     python -m src.cli stage4-import --model artifacts/model --encoder DIR --stacker FILE.txt [--stacker ...] --stacker-meta FILE.json
     python -m src.cli post-import --model artifacts/final --retriever DIR --recall-encoder DIR --head FILE --head-meta FILE --lists FILE
     python -m src.cli final   --data DATA --model artifacts/final --out OUTPUT   (the leaderboard run)
+    python -m src.cli check   --data DATA --out OUTPUT   (submission rules of written outputs, matches inside candidates)
     python -m src.cli encoder-train --data DATA --model BUNDLE --init DIR --out DIR [--draw N --exclude DIR]
     python -m src.cli recall-train  --data DATA --model artifacts/final
     python -m src.cli adapt-labels --data DATA --model BUNDLE --decision TSV --anchor-pool FILE --round N --out DIR
@@ -286,6 +287,9 @@ def main(argv=None) -> int:
                    help="score this saved recall new-pair list instead of retrieving (byte-exact leaderboard run)")
     p.add_argument("--derive-lists", action="store_true",
                    help="compute the lists of steps E-G with src/rules.py on the current decision instead of replaying them")
+    p = sub.add_parser("check")
+    p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
+    p.add_argument("--out", type=Path, required=True, help="folder with matching_results.tsv and candidate_pairs.tsv")
     p = sub.add_parser("encoder-train")
     p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
     p.add_argument("--model", type=Path, required=True, help="bundle (oof.parquet, ce_params)")
@@ -347,6 +351,9 @@ def main(argv=None) -> int:
             _post_import(args)
         elif args.command == "final":
             _final(args)
+        elif args.command == "check":
+            data.check_files(args.data, args.out)
+            log.info("%s: submission rules hold and every matched id is a candidate of its row", args.out)
         elif args.command == "encoder-train":
             pipeline.train_encoder(args.data, args.model, args.init, args.out, args.lr, args.draw, args.exclude, args.seed,
                                    cache=args.cache)

@@ -152,6 +152,20 @@ def test_submission_check_catches_violations():
         data.check_submission(ids, dup, dup)
 
 
+def test_check_command_finds_matches_outside_candidates(trained, dataset, tmp_path):
+    _, out_dir = trained
+    assert cli.main(["check", "--data", str(dataset), "--out", str(out_dir)]) == 0
+    m, c = _read(out_dir / "matching_results.tsv"), _read(out_dir / "candidate_pairs.tsv")
+    k = next(k for k, v in enumerate(m["matched_entity_ids"].to_list()) if v)
+    m.write_csv(tmp_path / "matching_results.tsv", separator="\t", quote_style="never")
+    c.with_columns(pl.when(pl.int_range(pl.len()) == k).then(pl.lit("")).otherwise(pl.col("candidate_entity_ids"))
+                   .alias("candidate_entity_ids")).write_csv(tmp_path / "candidate_pairs.tsv", separator="\t",
+                                                             quote_style="never")
+    with pytest.raises(data.DataError, match="missing from the candidate set"):
+        data.check_files(dataset, tmp_path)
+    assert cli.main(["check", "--data", str(dataset), "--out", str(tmp_path)]) == 2
+
+
 def test_missing_bundle_gives_exit_code_2(dataset, tmp_path):
     assert cli.main(["predict", "--data", str(dataset), "--model", str(tmp_path / "none"),
                      "--out", str(tmp_path)]) == 2

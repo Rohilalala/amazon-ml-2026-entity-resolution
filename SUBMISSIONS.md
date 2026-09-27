@@ -38,3 +38,5 @@ trained on US, scored on India 0.864.
 | 27 Sep | + test-time adaptation round 1 | 0.989 |
 | 27 Sep | + adaptation round 2 + France groupe/street fixes | 0.989538 |
 Probes (France only): France empty 0.851 (France F about 0.957 at the time); keep-more 0.985; more empties 0.986.
+| 27 Sep ~23:10 | + adaptation round 3 + sweep/extras/late France and India rules (#17) | **0.989667 (final best)** |
+| 27 Sep ~23:20 | #17 minus 4,084 least-confident France pairs + 129 France near-tie abstentions (#18) | 0.989601 |

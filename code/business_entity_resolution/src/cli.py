@@ -136,7 +136,8 @@ def _post_import(args) -> None:
 
 def _final(args) -> None:
     """The leaderboard run: stages 1-4, recall adds and the post-decision chain."""
-    matches, cands, report = final.predict(args.data, args.model, cache=args.cache, fixed_recall=args.recall_pairs)
+    matches, cands, report = final.predict(args.data, args.model, cache=args.cache, fixed_recall=args.recall_pairs,
+                                           derive_lists=args.derive_lists)
     _write(args, matches, cands, report)
 
 
@@ -283,6 +284,8 @@ def main(argv=None) -> int:
     p.add_argument("--cache", type=Path, default=None, help="reuse prepared records and candidates across runs")
     p.add_argument("--recall-pairs", type=Path, default=None,
                    help="score this saved recall new-pair list instead of retrieving (byte-exact leaderboard run)")
+    p.add_argument("--derive-lists", action="store_true",
+                   help="compute the lists of steps E-G with src/rules.py on the current decision instead of replaying them")
     p = sub.add_parser("encoder-train")
     p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
     p.add_argument("--model", type=Path, required=True, help="bundle (oof.parquet, ce_params)")

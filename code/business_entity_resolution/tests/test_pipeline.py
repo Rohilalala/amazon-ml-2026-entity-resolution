@@ -431,6 +431,15 @@ def test_final_with_a_saved_recall_list_matches(dataset, final_model):
         assert (out / "a" / f).read_bytes() == (out / "b" / f).read_bytes()
 
 
+def test_final_with_derived_lists(dataset, final_model):
+    model_dir, out, _ = final_model
+    assert cli.main(["final", "--data", str(dataset), "--model", str(model_dir), "--out", str(out / "c"),
+                     "--derive-lists"]) == 0
+    report = json.loads((model_dir / "predict_report.json").read_text())
+    assert {"E_lists", "F_lists", "G_lists"} <= set(report["post"])
+    assert (out / "c" / "matching_results.tsv").read_text().count("\n") == (out / "a" / "matching_results.tsv").read_text().count("\n")
+
+
 def test_encoder_and_recall_head_training(dataset, final_model, tmp_path):
     model_dir, _, final = final_model
     copy = tmp_path / "model"

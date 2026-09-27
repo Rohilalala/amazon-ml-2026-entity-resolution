@@ -22,7 +22,7 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
-from . import data, pair_encoder, pipeline, postprocess, recall, text as text_norm
+from . import data, pair_encoder, pipeline, postprocess, recall, rules, text as text_norm
 
 log = logging.getLogger(__name__)
 
@@ -37,21 +37,29 @@ def load_lists(bundle_dir: Path) -> dict:
 
 
 def post_chain(sub: pl.DataFrame, cands: pl.DataFrame, records: pl.DataFrame, raw: pl.DataFrame, P: pl.DataFrame,
-               head_meta: dict, lists: dict) -> tuple[pl.DataFrame, pl.DataFrame, dict, dict]:
+               head_meta: dict, lists: dict, derive: dict | None = None) -> tuple[pl.DataFrame, pl.DataFrame, dict, dict]:
     """Steps B-H on the stage-4 decision `sub` (postprocess frame) and its candidate frame.
     Returns the final frame, the candidate frame, a report and the frames after B and C (the
     next adaptation round's negatives come from them).
     `records`: row, entity_id, country_key, src of every test record; `raw`: data.load_split('test');
-    `P`: recall new pairs with the head probability (s1_row, j_row, country, prob)."""
+    `P`: recall new pairs with the head probability (s1_row, j_row, country, prob).
+    `derive` ({"prep": prepared records, "cand": candidate pairs, "active": active pairs}): compute
+    the lists of steps E-G with rules.derive on the current frame instead of replaying `lists`."""
     rep, t0 = {}, time.time()
     recs = postprocess.TestRecords(raw)
     b, cands, rep["B_recall"] = recall.apply(sub, cands, P, records, head_meta["t_keep"], head_meta["t_none"])
     c, rep["C_sister"] = postprocess.sister_filter(b, recs)
     d, rep["D_restore"] = postprocess.restore_scrambles(b, c, recs)
-    e, rep["E_lists"] = postprocess.apply_lists(d, lists["E", "drop"], lists["E", "add"])
-    f, rep["F_lists"] = postprocess.apply_lists(e, lists["F", "drop"], lists["F", "add"],
-                                                sources=lists["F", "add"].filter(pl.col("src").is_not_null()).select("s1", "m", "src"))
-    g, rep["G_lists"] = postprocess.apply_lists(f, lists["G", "drop"], lists["G", "add"], unique_adds=True)
+    def step(name, frame):
+        if derive is None:
+            src = lists[name, "add"].filter(pl.col("src").is_not_null()).select("s1", "m", "src") if name == "F" else None
+            return lists[name, "drop"], lists[name, "add"], src
+        return rules.derive(name, frame, recs, derive["prep"], derive["cand"], derive["active"], P, lists)
+    frame = d
+    for name in "EFG":
+        drops, adds, src = step(name, frame)
+        frame, rep[f"{name}_lists"] = postprocess.apply_lists(frame, drops, adds, sources=src, unique_adds=name == "G")
+    g = frame
     h, rep["H_lists"] = postprocess.apply_late(g, lists["H", "drop"], lists["H", "add"])
     log.info("post-decision chain in %.0fs: %s", time.time() - t0, rep)
     return h, cands, rep, {"after_recall": b, "after_sister": c}
@@ -106,23 +114,31 @@ def recall_pairs(bundle_dir: Path, records: pl.DataFrame, pairs: pl.DataFrame, t
     return P
 
 
-def predict(data_dir: Path, bundle_dir: Path, cache: Path | None = None, fixed_recall: Path | None = None
-            ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
+def predict(data_dir: Path, bundle_dir: Path, cache: Path | None = None, fixed_recall: Path | None = None,
+            derive_lists: bool = False) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Final match and candidate frames for the test split."""
     bundle = pipeline.Bundle.load(bundle_dir)
     if bundle.config.stage4_scope != "all" or bundle.stage4 is None:
         raise data.DataError(f"{bundle_dir}: the final run needs stage 4 with stage4_scope 'all'")
     ids, matches, cands, report = pipeline.predict(data_dir, bundle, cache=cache, bundle_dir=bundle_dir)
-    records, pairs, _ = pipeline.load_scores(bundle_dir)
+    records, pairs, probs = pipeline.load_scores(bundle_dir)
+    derive = None
+    if derive_lists:
+        prob = pipeline.select_probability(probs, bundle, records["country_key"].to_numpy()[pairs["i"].to_numpy()])
+        derive = {"prep": records, "cand": pairs.select("i", "j"),
+                  "active": pairs.select("i", "j").filter(pl.Series(prob >= bundle.config.stage4_active))}
+    del probs
     raw = data.load_split(data_dir, "test")
     text = pair_encoder.texts(raw)
     P = recall_pairs(bundle_dir, records.select("row", "entity_id", "src", "country_key"), pairs, text, fixed_recall)
-    del pairs
+    if derive is None:
+        del pairs
     sub = postprocess.frame(matches["s1"], matches["id"])
     cf = postprocess.frame(cands["s1"], cands["id"])
     head_meta = json.loads((bundle_dir / RECALL_DIR / recall.HEAD_META).read_text())
     sub, cf, report["post"], steps = post_chain(sub, cf, records, raw.select("entity_id", "src", "country", "business_name",
-                                                                            "business_address"), P, head_meta, load_lists(bundle_dir))
+                                                                            "business_address"), P, head_meta, load_lists(bundle_dir),
+                                                derive)
     for name, frame in steps.items():  # inputs of the next adaptation round (adapt-labels --negatives-from)
         data.write_id_lists(bundle_dir / "test_scores" / f"{name}.tsv", data.MATCH_COLUMN,
                             frame.rename({postprocess.S1: "s1", postprocess.M: "id"}))

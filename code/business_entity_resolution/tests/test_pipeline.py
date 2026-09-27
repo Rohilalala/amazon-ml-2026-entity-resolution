@@ -435,7 +435,7 @@ def test_final_stage4_members_and_outputs(dataset, final_model):
 
 def test_final_with_a_saved_recall_list_matches(dataset, final_model):
     model_dir, out, final = final_model
-    cached = model_dir / "test_scores" / "recall_pairs.parquet"
+    (cached,) = (model_dir / "test_scores").glob("recall_pairs_*.parquet")
     fixed = out / "recall_pairs.parquet"
     pl.read_parquet(cached).drop("prob").write_parquet(fixed)
     cached.unlink()

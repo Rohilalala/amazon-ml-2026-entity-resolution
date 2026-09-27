@@ -95,13 +95,18 @@ def retrieve(bundle_dir: Path, records: pl.DataFrame, pairs: pl.DataFrame, text:
 
 
 def recall_pairs(bundle_dir: Path, records: pl.DataFrame, pairs: pl.DataFrame, text: pl.Series,
-                 fixed: Path | None = None) -> pl.DataFrame:
-    """Recall new pairs with head probabilities, cached in test_scores/recall_pairs.parquet.
-    `fixed`: a saved new-pair list to score instead of retrieving (see README, recall pairs)."""
-    cache = bundle_dir / "test_scores" / "recall_pairs.parquet"
+                 fixed: Path | None = None, inputs: dict | None = None) -> pl.DataFrame:
+    """Recall new pairs with head probabilities, cached in test_scores/recall_pairs_<key>.parquet,
+    the key hashing the test files (`inputs`: name -> sha256), the recall model files and `fixed`
+    (a saved new-pair list to score instead of retrieving; see README, recall pairs)."""
+    rdir = bundle_dir / RECALL_DIR
+    files = [rdir / recall.HEAD_FILE, rdir / recall.ENCODER_DIR / "model.safetensors",
+             fixed or rdir / recall.RETRIEVER_DIR / "model.safetensors"]
+    key = pipeline._dict_hash({"inputs": inputs or {}, "files": [pipeline._sha256(f) for f in files],
+                               "fixed": bool(fixed)})
+    cache = bundle_dir / "test_scores" / f"recall_pairs_{key}.parquet"
     if cache.is_file():
         return pl.read_parquet(cache)
-    rdir = bundle_dir / RECALL_DIR
     t0 = time.time()
     P = pl.read_parquet(fixed) if fixed else retrieve(bundle_dir, records, pairs, text)
     ce = pair_encoder.score(rdir / recall.ENCODER_DIR, text, P["s1_row"].to_numpy(), P["j_row"].to_numpy(),
@@ -130,7 +135,8 @@ def predict(data_dir: Path, bundle_dir: Path, cache: Path | None = None, fixed_r
     del probs
     raw = data.load_split(data_dir, "test")
     text = pair_encoder.texts(raw)
-    P = recall_pairs(bundle_dir, records.select("row", "entity_id", "src", "country_key"), pairs, text, fixed_recall)
+    P = recall_pairs(bundle_dir, records.select("row", "entity_id", "src", "country_key"), pairs, text, fixed_recall,
+                     report["provenance"]["inputs"])
     if derive is None:
         del pairs
     sub = postprocess.frame(matches["s1"], matches["id"])

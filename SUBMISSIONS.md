@@ -24,3 +24,17 @@ trained on US, scored on India 0.864.
 |---|---|---|---|
 | 25 Sep 08:36 | output_v3 | 0.964386 | |
 | 25 Sep 22:49 | output_v7_final | **0.971137** | rank 460 on 26 Sep morning; DAY-1 BASE B |
+
+## Leaderboard log, 26-27 Sep (exact 6-decimal values where known)
+| When | File | LB |
+|---|---|---|
+| 26 Sep 11:36 | v7-final + US amb cap | 0.974 |
+| 27 Sep | stage 4 (cross-encoder v1), all countries / US+India | 0.985 / 0.985 |
+| 27 Sep | stage 4 v2 (more data + richer stacker) | 0.985 |
+| 27 Sep | + dense-recall adds | 0.986 |
+| 27 Sep | v3 encoder + recall | 0.986 |
+| 27 Sep | + France sister filter (strict) | 0.987 |
+| 27 Sep | + France sister filter v2 | 0.988 |
+| 27 Sep | + test-time adaptation round 1 | 0.989 |
+| 27 Sep | + adaptation round 2 + France groupe/street fixes | 0.989538 |
+Probes (France only): France empty 0.851 (France F about 0.957 at the time); keep-more 0.985; more empties 0.986.

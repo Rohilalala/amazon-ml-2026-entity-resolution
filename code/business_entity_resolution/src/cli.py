@@ -87,7 +87,7 @@ def _stage4_import(args) -> None:
     shutil.copytree(args.encoder, args.model / pair_encoder.ENCODER_DIR, dirs_exist_ok=True)
     shutil.copyfile(args.stacker, args.model / pipeline.STAGE4_FILE)
     pipeline.set_stage4_meta(args.model, meta["rule"], {
-        "imported": {"encoder": str(args.encoder), "stacker": str(args.stacker), "rounds": meta.get("rounds"),
+        "imported": {"encoder": args.encoder.name, "stacker": args.stacker.name, "rounds": meta.get("rounds"),
                      "encoder_sha256": pipeline._sha256(args.encoder / "model.safetensors"),
                      "stacker_sha256": pipeline._sha256(args.stacker)}})
     bundle = pipeline.Bundle.load(args.model)

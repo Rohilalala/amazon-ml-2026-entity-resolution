@@ -368,5 +368,6 @@ def test_stage4_import_copies_encoder_and_stacker(stage4_model, trained, tmp_pat
     assert cli.main(args) == 0
     bundle = pipeline.Bundle.load(copy)
     assert bundle.stage4_rule == rule and (copy / pipeline.STAGE4_FILE).read_bytes() == (src / pipeline.STAGE4_FILE).read_bytes()
+    assert str(src) not in (copy / pipeline.BUNDLE_FILE).read_text()  # file names only, no local paths
     meta.write_text(json.dumps({"features": stage4.FEATURES[:-1], "rule": rule}))
     assert cli.main(args) == 2

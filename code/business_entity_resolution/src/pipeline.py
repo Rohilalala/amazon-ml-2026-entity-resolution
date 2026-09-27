@@ -345,8 +345,10 @@ class Bundle:
         meta = {"config": self.config.to_dict(), "stages": stages, "variants": variants,
                 "rule": self.rule, "report": self.report}
         if self.stage4:
-            self.stage4.boosters[0].save_model(directory / STAGE4_FILE)
-            meta["stage4"] = {"features": self.stage4.features, "models": [STAGE4_FILE], "rule": self.stage4_rule}
+            files = stage4_files(len(self.stage4.boosters))
+            for b, f in zip(self.stage4.boosters, files):
+                b.save_model(directory / f)
+            meta["stage4"] = {"features": self.stage4.features, "models": files, "rule": self.stage4_rule}
         (directory / BUNDLE_FILE).write_text(json.dumps(meta, indent=2))
         (directory / NATIVE_FILE).write_text(json.dumps(self.native_words or {}, ensure_ascii=False,
                                                         sort_keys=True), encoding="utf-8")
@@ -374,6 +376,11 @@ class Bundle:
         return cls(Config.from_dict(meta["config"]), [stage(st) for st in meta["stages"]], meta["rule"],
                    meta["report"], words, {k: stage(v) for k, v in meta.get("variants", {}).items()},
                    vocab=vocab or None, stage4=stage(st4) if st4 else None, stage4_rule=st4 and st4["rule"])
+
+
+def stage4_files(n: int) -> list[str]:
+    """Stacker file names: stage4.txt for one model, stage4_m{k}.txt for seed members."""
+    return [STAGE4_FILE] if n == 1 else [f"stage4_m{k}.txt" for k in range(n)]
 
 
 def save_vocab(directory: Path, vocab: dict) -> None:
@@ -740,21 +747,27 @@ def _country_transfer(X, y, codes, n_true, country, cfg, rounds) -> dict:
     return out
 
 
-def train_stage4(data_dir: Path, bundle_dir: Path, base: Path, cache: Path | None = None) -> dict:
-    """Stage 4 for a trained bundle: fine-tune the pair encoder from the `base` checkpoint,
-    then cross-validate the stacker on the matcher's training sample and save both.
+def train_stage4(data_dir: Path, bundle_dir: Path, base: Path | None, cache: Path | None = None) -> dict:
+    """Stage 4 for a trained bundle: fine-tune the pair encoder from the `base` checkpoint (or,
+    with base None, keep the bundle's encoder/, e.g. an adapted one), then cross-validate the
+    stacker on the matcher's training sample and save both.
 
     Encoder data: training Source 1 records outside the matcher's sample and holdout
     (stage4.encoder_pairs), minus pairs whose candidate belongs to an active sample pair.
     Stacker rows: the active sample pairs, with the out-of-fold probability each is decided
-    on (oof.parquet, stage-3 choice per country as configured) and the new encoder's logit;
-    folds grouped by Source 1 record as in `train`; the decision rule is chosen on the
-    out-of-fold stage-4 probability, and the final model is refit on all active pairs with
-    the mean best iteration."""
+    on (oof.parquet, stage-3 choice per country as configured) and the encoder's logit;
+    feature set cfg.stage4_features; folds grouped by Source 1 record as in `train`; one
+    cross-validation per seed of cfg.stage4_seeds (fold assignment fixed by cfg.seed), the
+    out-of-fold probabilities averaged; the decision rule is chosen on that average, and each
+    seed's final model is refit on all active pairs with that seed's mean best iteration."""
     bundle = Bundle.load(bundle_dir)
     cfg, params = bundle.config, bundle.config.ce_params
+    names = stage4.FEATURE_SETS[cfg.stage4_features]
     if not (bundle_dir / "oof.parquet").is_file():
         raise data.DataError(f"{bundle_dir}/oof.parquet is needed to train stage 4")
+    enc_dir = bundle_dir / pair_encoder.ENCODER_DIR
+    if base is None and not (enc_dir / "model.safetensors").is_file():
+        raise data.DataError(f"no encoder in {enc_dir}; pass --base to fine-tune one")
     raw = data.load_split(data_dir, "train")
     truth = data.load_truth(data_dir / "train" / "train_ground_truth.tsv", raw)
     prov = provenance(data_dir, "train")
@@ -777,40 +790,102 @@ def train_stage4(data_dir: Path, bundle_dir: Path, base: Path, cache: Path | Non
     prob = select_probability(oof_probs, bundle, country)
     act = prob >= cfg.stage4_active
     A = oof.filter(pl.Series(act)).select("i", "j", "y", "entity")
-    used = pl.concat([sample["row"], holdout["row"]])
-    fit_pairs, val_pairs = stage4.encoder_pairs(pairs, truth, n_true_all.filter(~pl.col("row").is_in(used.implode())),
-                                                params, A["j"].unique())
+    enc_report = {"encoder": "kept from the bundle"}
+    if base is not None:
+        used = pl.concat([sample["row"], holdout["row"]])
+        fit_pairs, val_pairs = stage4.encoder_pairs(pairs, truth, n_true_all.filter(~pl.col("row").is_in(used.implode())),
+                                                    params, A["j"].unique())
+        enc_report = pair_encoder.train(base, enc_dir, pair_text, fit_pairs, val_pairs, params)
+    string_recs = recs.select(stage4.RECORD_COLUMNS) if cfg.stage4_features != "A" else None
     del recs, pairs
     gc.collect()
-    enc_dir = bundle_dir / pair_encoder.ENCODER_DIR
-    enc_report = pair_encoder.train(base, enc_dir, pair_text, fit_pairs, val_pairs, params)
     ce = pair_encoder.score(enc_dir, pair_text, A["i"].to_numpy(), A["j"].to_numpy(), params)
-    F = stage4.features(A.with_columns(prob=pl.Series(prob[act]), ce_logit=pl.Series(ce)),
-                        pair_encoder.empty_address(pair_text))
-    x, y, codes = stage4.matrix(F), A["y"].to_numpy(), oof["entity"].to_numpy()
+    F = A.with_columns(prob=pl.Series(prob[act]), ce_logit=pl.Series(ce))
+    empty = pair_encoder.empty_address(pair_text)
+    F = stage4.features(F, empty) if string_recs is None else stage4.features_acnrst(F, empty, string_recs)
+    x, y, codes = stage4.matrix(F, names), A["y"].to_numpy(), oof["entity"].to_numpy()
+    del F, string_recs
     cfg4 = replace(cfg, folds=stage4.FOLDS)
-    oof4, boosters = cross_validate(x, y, fold_ids(A["entity"].to_numpy(), cfg4), cfg4)
+    folds = fold_ids(A["entity"].to_numpy(), cfg4)
+    oofs, fold_rounds = [], []
+    for sd in cfg.stage4_seeds:
+        o, boosters = cross_validate(x, y, folds, replace(cfg4, seed=sd))
+        oofs.append(o)
+        fold_rounds.append([b.best_iteration for b in boosters])
     p4 = prob.astype(np.float64)
-    p4[act] = oof4
+    p4[act] = np.mean(oofs, axis=0)
     n_true, y_all = sample["n_true"].to_numpy(), oof["y"].to_numpy()
     f4, rule, trials = choose_rule(codes, n_true, p4, y_all)
-    rounds = max(1, int(np.mean([b.best_iteration for b in boosters])))
-    bundle.stage4, bundle.stage4_rule = Stage(stage4.FEATURES, [fit(x, y, cfg, rounds=rounds)]), rule
-    report = {"encoder": enc_report, "active_pairs": int(act.sum()), "fold_rounds": [b.best_iteration for b in boosters],
-              "final_rounds": rounds, "oof_f05": round(f4, 5), "rule": rule, "rule_trials": trials,
+    rounds = [max(1, int(np.mean(r))) for r in fold_rounds]
+    members = [fit(x, y, replace(cfg, seed=sd), rounds=n) for sd, n in zip(cfg.stage4_seeds, rounds)]
+    bundle.stage4, bundle.stage4_rule = Stage(names, members), rule
+    report = {"encoder": enc_report, "features": cfg.stage4_features, "seeds": cfg.stage4_seeds,
+              "active_pairs": int(act.sum()), "fold_rounds": fold_rounds, "final_rounds": rounds,
+              "oof_f05": round(f4, 5), "rule": rule, "rule_trials": trials,
               "oof_f05_without_stage4": round(choose_rule(codes, n_true, prob, y_all)[0], 5)}
     log.info("stage 4: %s", report)
-    bundle.stage4.boosters[0].save_model(bundle_dir / STAGE4_FILE)
-    set_stage4_meta(bundle_dir, bundle.stage4_rule, {**report, "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    files = stage4_files(len(members))
+    for b, f in zip(members, files):
+        b.save_model(bundle_dir / f)
+    set_stage4_meta(bundle_dir, bundle.stage4_rule, {**report, "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")},
+                    names, files)
     return report
 
 
-def set_stage4_meta(bundle_dir: Path, rule: dict, report: dict) -> None:
-    """Record stage 4 (stacker file, features, rule, how it was made) in a saved bundle.json."""
+def train_encoder(data_dir: Path, bundle_dir: Path, init: Path, out_dir: Path, lr: float, draw: int,
+                  exclude: list, seed: int, cache: Path | None = None) -> dict:
+    """Continued fine-tuning of a pair encoder (`init`) on fresh training Source 1 records: those
+    outside the matcher's sample and holdout and outside earlier draws (`exclude`: their
+    s1_draw.parquet files); `draw` of them at random (0 = all), 10,000 of those kept for the
+    validation AUC. Each record brings its top 8 candidates by retrieval score plus every true pair
+    among its candidates; fit pairs are those of rank <= 6 or true, minus pairs whose candidate
+    belongs to an active pair of the matcher's sample. One pass (pair_encoder.train) at `lr`.
+    The records drawn are saved to <out_dir>/s1_draw.parquet for the next round's `exclude`."""
+    bundle = Bundle.load(bundle_dir)
+    cfg, params = bundle.config, bundle.config.ce_params
+    raw = data.load_split(data_dir, "train")
+    truth = data.load_truth(data_dir / "train" / "train_ground_truth.tsv", raw)
+    prov = provenance(data_dir, "train")
+    text.set_native_words(bundle.native_words or {})
+    pair_text = pair_encoder.texts(raw)
+    recs, pairs = candidate_table(raw, cfg, {**prov["inputs"], "native_words": _dict_hash(bundle.native_words or {})}, cache)
+    del raw
+    s1 = recs.filter(pl.col("src") == 1).select("row", "country_key")
+    n_true_all = s1.join(truth.group_by("i").len("n_true"), left_on="row", right_on="i", how="left") \
+        .with_columns(pl.col("n_true").fill_null(0))
+    sample, holdout = sample_and_holdout(n_true_all, cfg)
+    oof = pl.read_parquet(bundle_dir / "oof.parquet", columns=["i", "j", "oof_stage2", "oof"] +
+                          (["oof_robust"] if "oof_robust" in pl.read_parquet_schema(bundle_dir / "oof.parquet") else []))
+    probs = {"stage2": oof["oof_stage2"].to_numpy(), "full": oof["oof"].to_numpy()}
+    if "oof_robust" in oof.columns:
+        probs["robust"] = oof["oof_robust"].to_numpy()
+    prob = select_probability(probs, bundle, recs["country_key"].to_numpy()[oof["i"].to_numpy()])
+    exclude_j = oof.filter(pl.Series(prob >= cfg.stage4_active))["j"].unique()
+    used = pl.concat([sample["row"], holdout["row"], *[pl.read_parquet(Path(f) / "s1_draw.parquet")["i"] for f in exclude]])
+    pool = n_true_all.filter(~pl.col("row").is_in(used.implode())).sort("row")
+    fresh = (pool.sample(draw, seed=seed) if draw else pool).sort("row")
+    val = fresh.sample(min(10_000, fresh.height // 10), seed=seed + 1)["row"]
+    P = (pairs.select("i", "j", "score").filter(pl.col("i").is_in(fresh["row"].implode()))
+         .join(truth.with_columns(pl.lit(1, dtype=pl.Int8).alias("y")), on=["i", "j"], how="left")
+         .with_columns(pl.col("y").fill_null(0), pl.col("score").rank("ordinal", descending=True).over("i").alias("rank"))
+         .filter((pl.col("rank") <= 8) | (pl.col("y") == 1)).sort("i", "rank"))
+    is_val, fits = pl.col("i").is_in(val.implode()), (pl.col("rank") <= 6) | (pl.col("y") == 1)
+    fit = P.filter(~is_val & fits & ~pl.col("j").is_in(exclude_j.implode())).select("i", "j", "y")
+    report = pair_encoder.train(init, out_dir, pair_text, fit, P.filter(is_val & fits).select("i", "j", "y"),
+                                {**params, "lr": lr})
+    fresh.select(pl.col("row").alias("i"), is_val=pl.col("row").is_in(val.implode())).write_parquet(out_dir / "s1_draw.parquet")
+    report.update(init=str(init.name), lr=lr, fresh_s1=fresh.height, val_s1=val.len())
+    (out_dir / "encoder_report.json").write_text(json.dumps(report, indent=2))
+    return report
+
+
+def set_stage4_meta(bundle_dir: Path, rule: dict, report: dict, features: list = stage4.FEATURES,
+                    models: list = (STAGE4_FILE,)) -> None:
+    """Record stage 4 (stacker files, features, rule, how it was made) in a saved bundle.json."""
     path = bundle_dir / BUNDLE_FILE
     meta = json.loads(path.read_text())
     meta["config"] = Config.from_dict(meta["config"]).to_dict()  # writes the stage-4 settings in use
-    meta["stage4"] = {"features": stage4.FEATURES, "models": [STAGE4_FILE], "rule": rule}
+    meta["stage4"] = {"features": list(features), "models": list(models), "rule": rule}
     meta["report"]["stage4"] = report
     path.write_text(json.dumps(meta, indent=2))
 
@@ -845,7 +920,10 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_di
     log.info("scored %d pairs with %d stage(s) in %.1fs (peak %.1f GB)", pairs.height, len(bundle.stages),
              time.time() - t0, peak_gb())
     del tables
-    records, pairs = recs.select(RECORD_COLUMNS), pairs.select("i", "j")
+    keep_cols = list(RECORD_COLUMNS)
+    if bundle.stage4 is not None and stage4.feature_set(bundle.stage4.features) != "A":
+        keep_cols += [c for c in stage4.RECORD_COLUMNS if c not in keep_cols]
+    records, pairs = recs.select(keep_cols), pairs.select("i", "j")
     del recs
     pair_country = records["country_key"].to_numpy()[pairs["i"].to_numpy()]
     prob = select_probability(probs, bundle, pair_country)
@@ -913,7 +991,9 @@ def finish(records: pl.DataFrame, pairs: pl.DataFrame, prob: np.ndarray, bundle:
         ce = pairs["ce_logit"].to_numpy() if "ce_logit" in pairs.columns else None
         if bundle.stage4 is None or ce is None or np.isnan(ce[act]).any():
             raise data.DataError("saved test scores lack pair-encoder logits; re-run `predict` with stage4_scope set")
-        prob = stage4.probability(bundle.stage4, i, j, prob, ce, records["addr_empty"].to_numpy(), act)
+        if stage4.feature_set(bundle.stage4.features) != "A" and not set(stage4.RECORD_COLUMNS) <= set(records.columns):
+            raise data.DataError("saved test records lack the string columns the stage-4 stacker reads; re-run `predict`")
+        prob = stage4.probability(bundle.stage4, i, j, prob, ce, records["addr_empty"].to_numpy(), act, records)
         stage4_report["active_pairs"] = int(act.sum())
         log.info("stage 4 rescored %d active pairs of %s", int(act.sum()), stage4_report["countries"])
     pairs = pairs.select("i", "j")

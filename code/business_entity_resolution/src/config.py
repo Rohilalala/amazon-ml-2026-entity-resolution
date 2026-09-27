@@ -98,6 +98,10 @@ class Config:
     # then go through the calibration and unseen_rules on the stage-4 probability).
     stage4_scope: str = "none"
     stage4_active: float = 0.002
+    # Stacker feature set ("A" or "ACNRST", stage4.FEATURE_SETS) and LightGBM seeds: one model per
+    # seed, probabilities averaged (the leaderboard run: ACNRST, seeds 42, 7, 99).
+    stage4_features: str = "A"
+    stage4_seeds: list = field(default_factory=lambda: [42])
     ce_params: dict = field(default_factory=_default_ce_params)
     lgb_params: dict = field(default_factory=_default_lgb_params)
     stage3_lgb_params: dict = field(default_factory=lambda: {"learning_rate": 0.05, "num_leaves": 63})

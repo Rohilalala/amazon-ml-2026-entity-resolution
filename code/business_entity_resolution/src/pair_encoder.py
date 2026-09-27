@@ -158,7 +158,8 @@ def _train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: p
     model.get_input_embeddings().weight.requires_grad_(False)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=params["lr"],
                             weight_decay=params["weight_decay"])
-    fit = fit.gather(np.random.default_rng(params["seed"]).permutation(fit.height))
+    rng = np.random.default_rng(params["seed"])  # one stream: pair order, then batch order
+    fit = fit.gather(rng.permutation(fit.height))
     ids = []
     for s in range(0, fit.height, CHUNK):
         ids += _tokenize(tok, text, fit["i"][s:s + CHUNK].to_numpy(), fit["j"][s:s + CHUNK].to_numpy(),
@@ -170,7 +171,6 @@ def _train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: p
         c = np.arange(s, min(s + bs * 64, len(ids)))
         c = c[np.argsort(lens[c], kind="stable")]
         batches += [c[k:k + bs] for k in range(0, len(c), bs)]
-    rng = np.random.default_rng(params["seed"])
     batches = [batches[k] for k in rng.permutation(len(batches))]
     log.info("pair encoder training on %s: %d pairs (%d positives), %d steps", dev, len(ids), int(y.sum()), len(batches))
     model.train()

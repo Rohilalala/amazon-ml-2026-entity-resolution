@@ -1,0 +1,15 @@
+import polars as pl
+R = "/Users/adityarohilla/Documents/amazon-ml-2026/"; O = R + "v8_lab/hunt/deep/usin/out/"
+h = pl.read_parquet(R + "v8_lab/ce/setup/out/holdout_pairs.parquet", columns=["i", "j", "y", "active", "prob", "country"])
+h = h.with_columns(pl.read_parquet(R + "v8_lab/ce/v2_build/out/holdout_keeps.parquet", columns=["ACNRST_3s_v2ce"])["ACNRST_3s_v2ce"].alias("keep"))
+recs = pl.read_parquet(R + "cache/58f0a60c5c264fdd/recs.parquet", columns=["row", "core", "house"])
+h = h.join(recs.rename({"row": "i", "core": "c1", "house": "h1"}), on="i").join(recs.rename({"row": "j", "core": "c2", "house": "h2"}), on="j")
+m = h.filter((pl.col("c1") == pl.col("c2")) & (pl.col("h1").is_null() | pl.col("h2").is_null() | (pl.col("h1") == "") | (pl.col("h2") == "")))
+m = m.with_columns(h1miss=pl.col("h1").is_null() | (pl.col("h1") == ""), h2miss=pl.col("h2").is_null() | (pl.col("h2") == ""))
+m.write_parquet(O + "holdout_missexact.parquet")
+print(m.group_by("country", "h1miss", "h2miss", "keep").agg(n=pl.len(), true=pl.col("y").sum(), act=pl.col("active").sum()).sort("country", "h1miss", "h2miss", "keep"))
+s = pl.read_parquet(O + "holdout_s1_f.parquet")
+tr = pl.read_parquet(R + "v8_lab/ce/setup/out/text_train.parquet")
+x = m.filter(~pl.col("keep")).join(s.select("i", "k", "n_true"), on="i").join(tr.rename({"row": "i", "text": "s1"}), on="i").join(tr.rename({"row": "j", "text": "cand"}), on="j")
+pl.Config.set_tbl_rows(60); pl.Config.set_fmt_str_lengths(80); pl.Config.set_tbl_width_chars(250)
+print(x.filter(pl.col("country") == "us").sample(40, seed=3).select("y", "prob", "k", "n_true", "s1", "cand").sort("y"))

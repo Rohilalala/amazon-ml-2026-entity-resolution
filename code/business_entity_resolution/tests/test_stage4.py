@@ -93,3 +93,14 @@ def test_configure_rejects_an_unknown_scope(tmp_path):
     (tmp_path / pipeline.BUNDLE_FILE).write_text(__import__("json").dumps({"config": Config().to_dict()}))
     assert cli.main(["configure", "--model", str(tmp_path), "--set", 'stage4_scope="seen"']) == 0
     assert cli.main(["configure", "--model", str(tmp_path), "--set", 'stage4_scope="some"']) == 2
+
+
+def test_isolated_child_does_not_import_the_callers_main(tmp_path):
+    # The child must not re-import the caller (it would load LightGBM next to torch); run as a script and as -m.
+    root = Path(__file__).resolve().parents[1]
+    (tmp_path / "caller.py").write_text(f"import sys\nsys.path.insert(0, {str(root)!r})\nprint('imported', flush=True)\n"
+                                        "from src import pair_encoder\nif __name__ == '__main__':\n"
+                                        "    print(pair_encoder._isolated(sorted, [2, 1]), flush=True)\n")
+    for args in ([str(tmp_path / "caller.py")], ["-m", "caller"]):
+        res = subprocess.run([sys.executable, *args], capture_output=True, text=True, cwd=tmp_path, timeout=120)
+        assert res.stdout.split("\n")[:2] == ["imported", "[1, 2]"], res.stdout + res.stderr

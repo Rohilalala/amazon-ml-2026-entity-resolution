@@ -14,6 +14,7 @@ import logging
 import math
 import multiprocessing
 import os
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -105,9 +106,21 @@ def _child_logging() -> None:
 
 
 def _isolated(fn, *args):
-    """fn(*args) in a new process (spawned, so it loads torch but not LightGBM)."""
+    """fn(*args) in a new process, spawned so that it loads torch but not LightGBM. The child starts
+    without the caller's main module: spawn would import it (for `-m src.cli`, the CLI and with it
+    LightGBM), and LightGBM's OpenMP runtime next to torch's crashes the child as soon as torch
+    runs a parallel loop on the CPU (e.g. converting weights to bfloat16)."""
     with ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"), initializer=_child_logging) as pool:
-        return pool.submit(fn, *args).result()
+        main = sys.modules["__main__"]
+        spec, path = getattr(main, "__spec__", None), main.__dict__.pop("__file__", None)
+        main.__spec__ = None
+        try:
+            future = pool.submit(fn, *args)  # starts the child
+        finally:
+            main.__spec__ = spec
+            if path is not None:
+                main.__file__ = path
+        return future.result()
 
 
 def score(model_dir: Path, text: pl.Series, i: np.ndarray, j: np.ndarray, params: dict) -> np.ndarray:

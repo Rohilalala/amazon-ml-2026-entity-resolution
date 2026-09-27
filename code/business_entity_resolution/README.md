@@ -241,7 +241,7 @@ leaderboard run applied them:
 | G drop | generator source-cap excess copies | 12 | data only | round-2 final decision |
 | G drop | US state conflicts | 13 | data only | day-1 US decision |
 | G add | France 'groupe' copies of names without a legal form | 517 | data only | round-1 decision |
-| H drop | France region conflicts | 3 | data only | round-2 decision |
+| H drop | France region conflicts | 3 | `region_conflict_drops` (exact) | round-2 decision |
 | H drop | France near-tie ownership (both owners about equally likely) | 274 | data only: no saved builder; the closest rule (score margin <= 0.02, both >= 0.9) gives 287 | round-2 scores |
 
 "Exact" means the function returns the shipped list when run on the decision named in the last

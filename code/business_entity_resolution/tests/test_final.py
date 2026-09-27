@@ -84,6 +84,8 @@ def test_name_rules():
     assert rules.cie_tailmid_rule("martin et cie sarl", "martin et compagnie sarl") == "fr_cie"
     assert rules.cie_tailmid_rule("martin bois services", "martin services groupe") == "fr_tailmid"
     assert rules.cie_tailmid_rule("martin bois services", "martin bois groupe") is None  # last word: E's rule
+    assert rules.region("12 rue x, Bordeaux, Nouvelle-Aquitaine") == "NA" and rules.region("3 place y, 59000 Lille") == "HF"
+    assert rules.region("5 rue a, Gironde, Nord") is None and rules.region("") is None
 
 
 def _prep(raw: pl.DataFrame) -> pl.DataFrame:

@@ -16,9 +16,9 @@ lists.parquet by default; `derive` recomputes the lists on the current frame ins
                                address as a kept record (a pool copy), with its source records.
   G drops  sister2_drops       France: a sister-organisation word swap at any position (the step C
                                rule without its position constraint).
+  H drops  region_conflict_drops  France: the two addresses name (or have cities in) different regions.
 Lists without code here (lists.parquet only, see README): G source-cap drops, US state-conflict
-drops and France no-legal-form groupe adds; H region-conflict drops and near-tie ownership
-abstention.
+drops and France no-legal-form groupe adds; H near-tie ownership abstention.
 """
 import collections
 import difflib
@@ -277,6 +277,50 @@ def with_sources(adds: pl.DataFrame, sub: pl.DataFrame, prep: pl.DataFrame) -> p
     return adds.join(S, on=["s1", "m"], how="left", maintain_order="left")
 
 
+# France regions named in addresses (as region or department) and the cities of the test pool that imply one.
+REGIONS = {"nouvelle aquitaine": "NA", "gironde": "NA", "hauts de france": "HF", "nord": "HF", "pas de calais": "HF",
+           "pays de la loire": "PL", "loire atlantique": "PL"}
+REGION_CITIES = {"bordeaux": "NA", "pessac": "NA", "merignac": "NA", "la teste de buch": "NA", "lege cap ferret": "NA",
+                 "nantes": "PL", "saint nazaire": "PL", "pornic": "PL", "saint herblain": "PL", "la baule escoublac": "PL",
+                 "lille": "HF", "tourcoing": "HF", "dunkerque": "HF", "roubaix": "HF", "calais": "HF"}
+_REGION_WORDS = {"nouvelle aquitaine", "hauts de france", "pays de la loire", "gironde", "nord", "pas de calais",
+                 "loire atlantique", "france"}
+
+
+def _fold(a: str) -> str:
+    return "".join(ch for ch in unicodedata.normalize("NFKD", a) if not unicodedata.combining(ch)).lower()
+
+
+def region(a: str | None) -> str | None:
+    """Region of a France address: the one region its comma parts name, else the region of its city
+    (last comma part that is not a region and has no digit)."""
+    if not a:
+        return None
+    s = _fold(a)
+    named = {REGIONS[x] for x in (re.sub(r"[\-\.]", " ", c).strip() for c in s.split(",")) if x in REGIONS}
+    if len(named) == 1:
+        return named.pop()
+    cities = []
+    for c in s.split(","):
+        c = re.sub(r"[\-\.']", " ", c)
+        c = re.sub(r"\bst\b", "saint", c)
+        c = re.sub(r"\bste\b", "sainte", c)
+        c = re.sub(r"\s+", " ", re.sub(r"\d{5}", "", c)).strip()
+        if c and c not in _REGION_WORDS and not re.search(r"\d", c):
+            cities.append(c)
+    return REGION_CITIES.get(cities[-1]) if cities else None
+
+
+def region_conflict_drops(sub: pl.DataFrame, recs: postprocess.TestRecords) -> pl.DataFrame:
+    """H drops: France kept pairs whose two addresses sit in different regions."""
+    out = []
+    for a, b, _, a1 in _france_pairs(sub, recs):
+        r1, r2 = region(a1), region(recs.addr.get(b, ""))
+        if r1 and r2 and r1 != r2:
+            out.append((a, b))
+    return pl.DataFrame(out, schema={"s1": pl.String, "m": pl.String}, orient="row")
+
+
 def derive(step: str, sub: pl.DataFrame, recs: postprocess.TestRecords, prep: pl.DataFrame, cand: pl.DataFrame,
            active: pl.DataFrame, recall_pairs: pl.DataFrame, shipped: dict) -> tuple:
     """(drops, adds, sources) of one step computed on the current frame; lists without code come
@@ -291,4 +335,7 @@ def derive(step: str, sub: pl.DataFrame, recs: postprocess.TestRecords, prep: pl
     if step == "G":
         rest = shipped["G", "drop"].filter(pl.col("rule") != "sister2").select("s1", "m")
         return pl.concat([sister2_drops(sub, recs), rest]), shipped["G", "add"].select("s1", "m"), None
+    if step == "H":
+        rest = shipped["H", "drop"].filter(pl.col("rule") != "fr_region_conflict").select("s1", "m")
+        return pl.concat([region_conflict_drops(sub, recs), rest]), shipped["H", "add"].select("s1", "m"), None
     return shipped[step, "drop"], shipped[step, "add"], None

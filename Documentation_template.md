@@ -12,12 +12,16 @@ A retrieve-then-rank pipeline:
 
 1. IDF-weighted retrieval over rare token *combinations* for blocking.
 2. A three-stage LightGBM matcher.
-3. A per-record rule that maximises expected F0.5.
+3. Stage 4: a fine-tuned multilingual pair encoder (intfloat/multilingual-e5-small,
+   MIT licence) reads the raw text of the likely pairs, and a LightGBM stacker
+   combines its score with the matcher's probability.
+4. A per-record rule that maximises expected F0.5.
 
 Blocking finds 98.7% of true pairs at 25 candidates per Source 1 record, a
 perfect-matcher ceiling of 0.996. On 100k Source 1 records held out from all
 training and scored exactly like the test set, the matcher reaches a macro
-F0.5 of **0.9873**.
+F0.5 of **0.9873**. With the production decision rules, stage 4 raises the
+same holdout from 0.9870 to **0.9888** (+0.0018, 95% CI +0.0016 to +0.0020).
 
 The main contributions are:
 
@@ -70,7 +74,8 @@ Findings from the full training set (2.2M Source 1, 5.0M Source 2, 5.3M Source 3
 
 ### 2.2 Solution Strategy
 
-**Approach Type:** Blocking + three-stage LightGBM classifier + expected-F0.5 decision rule.
+**Approach Type:** Blocking + three-stage LightGBM classifier + fine-tuned pair encoder with a
+LightGBM stacker (stage 4) + expected-F0.5 decision rule.
 
 **Core Innovation:**
 
@@ -83,11 +88,16 @@ Findings from the full training set (2.2M Source 1, 5.0M Source 2, 5.3M Source 3
 - Predict-time corrections for the test pool's shift, without retraining
   (section 4): an ambiguity-count cap, training-pool token frequencies, and
   post-decision rules for the country absent from training.
+- A cross-encoder over the raw record text as a second opinion on the likely
+  pairs, stacked with the matcher by a small LightGBM (section 4, stage 4).
 
 Only the provided data is used: no external databases, geocoding or APIs. The
-dictionary and locale rules are learned from the provided files. All models
-are LightGBM (MIT licence). Country restricts the search and selects
-data-driven normalisation, but it is never a model feature.
+dictionary and locale rules are learned from the provided files. The matcher
+and the stage-4 stacker are LightGBM (MIT licence). The stage-4 pair encoder is
+the pretrained `intfloat/multilingual-e5-small` (MIT licence, 117.65M
+parameters with the classification head), fine-tuned on the training files
+only and read offline from the submitted bundle. Country restricts the search
+and selects data-driven normalisation, but it is never a model feature.
 
 ---
 
@@ -277,6 +287,58 @@ letters ("pi1ates"→"pilates").
   labels on this test set's unseen country, and country names never appear in
   the logic.
 
+**Stage 4: pair encoder and stacker (v9, submitted).**
+
+- **Pair encoder.** Base checkpoint `intfloat/multilingual-e5-small` (MIT
+  licence, Hugging Face revision 614241f622f53c4eeff9890bdc4f31cfecc418b3,
+  117.65M parameters), fine-tuned as a cross-encoder with one match logit.
+  Each record is its raw text, lowercased: `business_name | business_address`,
+  accents, punctuation and legal forms kept. The pair is the two texts,
+  truncated to 128 tokens.
+- **Encoder training data** (training files only): 360,000 training Source 1
+  records drawn outside the matcher's 500k sample and 100k holdout (20,000 kept
+  apart for validation), each with its top 6 candidates by retrieval score plus
+  every true pair among its candidates. Fit pairs whose Source 2/3 record
+  appears in any active pair of the matcher's sample or holdout are dropped, so
+  the encoder never saw the candidates of the pairs the stacker is trained or
+  measured on. That leaves 1,817,581 fit pairs (1,145,172 positive).
+- **Fine-tuning:** one pass, batch 128, binary cross-entropy, AdamW (learning
+  rate 3e-5, weight decay 0.01), 5% linear warmup then linear decay, gradient
+  clipping at 1.0, word embeddings frozen, bfloat16 autocast, batches of
+  similar token length. 72 minutes on the laptop's Apple GPU (PyTorch MPS).
+  Validation AUC 0.9979, against 0.9192 for the retrieval score alone.
+- **Stacker:** rescores only the *active* pairs, whose decided probability is
+  at least 0.002 (99.98% of the true pairs among the candidates). Eight
+  features: the logit of the decided probability; the encoder logit; an
+  empty-candidate-address flag; for both scores, the rank and the gap to the
+  best other active candidate of the same Source 1 record; and the number of
+  active candidates of that record. The flag matters because the pair filter
+  above removed most negatives of empty-address candidates (they sit in many
+  pools), so the encoder is over-confident there and the stacker learns by how
+  much. LightGBM with the matcher's parameters, trained on the 2.32M active
+  pairs of the matcher's sample with their out-of-fold probabilities and the
+  encoder's logits, 5-fold cross-validation grouped by Source 1 record, and the
+  decision rule chosen on the out-of-fold stage-4 probability (expected F0.5,
+  missed-match term 0.05); final model refit on all active pairs (119 trees).
+- **Holdout** (the 100k Source 1 records, used by neither the encoder nor the
+  stacker): 0.98702 → 0.98881 macro F0.5 with the production decision (US
+  0.98722 → 0.98920, India 0.98673 → 0.98824); among the active pairs, false
+  positives 726 → 488 and missed true pairs 7,266 → 6,311. Trained on one
+  country and scored on the other, the gain holds (US → India +0.0014).
+- **Test:** 8.08M active test pairs, about 40 minutes on the Apple GPU at
+  batch 1024 with bfloat16 autocast; stages 1–3 stay on the CPU. The
+  fine-tuned weights ship in float32 (470 MB): stored in 16 bits they changed
+  about a fifth of the logits.
+- **Scope and France.** The setting `stage4_scope` chooses the countries
+  decided on stage 4: `seen` (countries with training labels) or `all`. The
+  encoder never saw France, and no label can measure it there (its agreement
+  with the matcher's keeps is 96.1% in France against 99.1–99.4% in the US and
+  India). Under `seen`, France is decided exactly as in v8 (stage-2
+  probabilities, the pinned calibration, the unseen-country rules). Under
+  `all`, France gets the stage-4 probabilities, then the same calibration (its
+  "keep nothing" weight reaches the 4× cap) and the same unseen-country rules.
+  **The submitted bundle uses `stage4_scope = seen`.**
+
 ---
 
 ## 5. Results & Error Analysis
@@ -295,6 +357,7 @@ letters ("pi1ates"→"pilates").
 | v5 | Indic dictionary, rarest-word keys, token-alignment and ambiguity features, stage 3, 500k records | 0.9851 (holdout) |
 | v7 | transliteration-aware and address-pair keys, locale normalisation, per-country stage-3 choice | 0.9873 (holdout) |
 | v8 | v7 models + test-pool corrections (ambiguity cap, training-pool token frequencies, unseen-country rules) | not measured on the holdout (the corrections target the test pool) |
+| v9 | v8 + stage 4 (fine-tuned multilingual-e5-small pair encoder + LightGBM stacker) | 0.98881 vs 0.98702 for the production decision (holdout) |
 
 - **Common false positives (wrong merges):**
   - decoys with the same name and street but a nearby house number
@@ -336,7 +399,7 @@ country.
 
 | Path | Role |
 |---|---|
-| `src/cli.py` | Entry point: `run` (train + predict), `train`, `predict`, `block` (blocking recall only), `decide` (re-apply the decision rule to saved scores), `vocab` (add training-pool token tables to a bundle), `configure` (change a saved setting) |
+| `src/cli.py` | Entry point: `run` (train + predict), `train`, `predict`, `block` (blocking recall only), `decide` (re-apply the decision rule to saved scores), `vocab` (add training-pool token tables to a bundle), `configure` (change a saved setting), `stage4-train` (fine-tune the encoder and train the stacker into a bundle), `stage4-import` (add an already trained encoder and stacker to a bundle) |
 | `src/data.py` | TSV loading with schema checks; submission-rule checks; atomic writes |
 | `src/text.py` | Normalisation, transliteration, state codes, skeletons |
 | `src/indic.py` | Indic-to-English word dictionary learned from training pairs |
@@ -346,9 +409,11 @@ country.
 | `src/groupfeat.py` | Stage-3 group features |
 | `src/pipeline.py` | Training (grouped cross-validation, three stages, rule selection, honest holdout), prediction, decision, model bundle |
 | `src/unseen_rules.py` | Post-decision rules for a country absent from training |
+| `src/pair_encoder.py` | Stage-4 pair text, encoder fine-tuning and inference (PyTorch, in a separate process) |
+| `src/stage4.py` | Stage-4 features, stacker scoring, scope routing, encoder training-pair selection |
 | `src/metric.py` | Macro F0.5, reference and vectorised forms |
 | `src/config.py` | All settings; saved inside the model bundle |
-| `tests/` | 56 tests, including synthetic end-to-end runs checked with the challenge validator |
+| `tests/` | 69 tests, including synthetic end-to-end runs (stage 4 with a tiny encoder on the CPU) checked with the challenge validator |
 
 To reproduce both output files:
 
@@ -359,13 +424,16 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
     --out ../../output --sample 500000 --folds 4
 ```
 
-On a 24 GB, CPU-only laptop, blocking takes about 50 minutes per split,
-training about 1 hour and test scoring about 50 minutes. Peak memory is under
-21 GB. Pass `--cache DIR` to reuse the candidate tables between runs.
+On a 24 GB laptop (Apple M-series), blocking takes about 50 minutes per
+split, training about 1 hour and test scoring about 50 minutes, all on the
+CPU. Stage 4 runs on the Apple GPU (PyTorch MPS; CUDA or, much slower, the CPU
+elsewhere): fine-tuning about 72 minutes, test encoding about 40 minutes.
+Peak memory is under 21 GB. Pass `--cache DIR` to reuse the candidate tables
+between runs. No network is used at run time.
 
-The submitted files come from the v8 bundle: the v7 bundle plus the
-training-pool token tables and the corrected settings. With the v7 bundle in
-`artifacts/v7`:
+The submitted files come from the v9 bundle: the v8 bundle (the v7 bundle plus
+the training-pool token tables and the corrected settings) plus stage 4. With
+the v7 bundle in `artifacts/v7`:
 
 ```bash
 cp -R artifacts/v7 artifacts/v8
@@ -374,10 +442,18 @@ cp -R artifacts/v7 artifacts/v8
     --set 'feature_caps={"amb_s23_addr_2": 1.0}' --set 'feature_cap_countries=[]' \
     --set 'stage3_use="none"' --set 'stage3_by_country={"india": "full"}' \
     --set 'unseen_empty_target=0.05597295153414383' --set 'unseen_rules=true'
-.venv/bin/python -m src.cli predict --data <dataset dir> --model artifacts/v8 --out ../../output
+mkdir artifacts/v9 && cp artifacts/v8/*.* artifacts/v9/
+.venv/bin/python -m src.cli stage4-import --model artifacts/v9 --encoder <fine-tuned encoder dir> \
+    --stacker stage4_A.txt --stacker-meta stage4_A.json
+.venv/bin/python -m src.cli configure --model artifacts/v9 --set 'stage4_scope="seen"'
+.venv/bin/python -m src.cli predict --data <dataset dir> --model artifacts/v9 --out ../../output
 ```
 
-The zip carries `artifacts/v8` ready made (see the code README), so only the
+`stage4-train --data <dataset dir> --model artifacts/v9 --base <base checkpoint>`
+retrains stage 4 instead of importing it; the base checkpoint is downloaded
+once beforehand (`hf download intfloat/multilingual-e5-small --revision
+614241f622f53c4eeff9890bdc4f31cfecc418b3`). The zip carries `artifacts/v9`
+ready made, fine-tuned weights included (see the code README), so only the
 last command is needed.
 
 ### B. Additional Results

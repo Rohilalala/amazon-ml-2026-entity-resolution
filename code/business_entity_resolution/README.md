@@ -14,12 +14,18 @@ python3.12 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt    # + pytest, for the test suite
 ```
 
-`requirements.txt` includes `torch` and `transformers` for stage 4 (below).
+`requirements.txt` includes `torch` and `transformers` for stage 4 (below). It was frozen
+on macOS (Apple silicon); on Linux, `torch==2.14.0` also pulls CUDA wheels (`nvidia-*`,
+`triton`) that are not pinned here.
 
 Hardware used: one laptop (Apple M-series, 24 GB unified memory). Stages 1-3 run on
 the CPU. Stage 4's pair encoder runs on the Apple GPU (PyTorch MPS), on CUDA when
 present, else on the CPU (much slower). No network access is needed at run time:
-every model is read from the bundle, with `HF_HUB_OFFLINE=1`.
+every model is read from the bundle. `src/pair_encoder.py` sets `HF_HUB_OFFLINE=1`,
+`TOKENIZERS_PARALLELISM=true`, `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.7` and
+`PYTORCH_MPS_LOW_WATERMARK_RATIO=0.6` unless they are already set: the settings the v9
+run was verified with (the watermarks cap the Apple GPU allocator cache, so a blow-up
+raises instead of swapping; none of them changes a number).
 
 ## Reproduce end to end
 
@@ -33,7 +39,8 @@ This trains, validates, saves the model bundle to `artifacts/model/`, and writes
 `../../output/matching_results.tsv` and `../../output/candidate_pairs.tsv`.
 It uses the defaults in `src/config.py`, which save the training-pool vocabulary
 tables but leave the other predict-time corrections off (`feature_caps={}`,
-`unseen_rules=false`). The submitted outputs come from the v8 bundle below.
+`unseen_rules=false`). The submitted outputs come from the v9 bundle below (the v8
+bundle plus stage 4).
 
 The two stages can also run separately:
 
@@ -46,7 +53,7 @@ The two stages can also run separately:
 rule) from the bundle, so it cannot drift from what was validated. The same
 inputs and bundle give byte-identical outputs.
 
-### The submitted bundle (v8)
+### The v8 bundle
 
 `artifacts/v8` is the trained v7 bundle with predict-time corrections and no
 retraining. It was made from `artifacts/v7` (the bundle `train` saved for v7: models,
@@ -73,7 +80,7 @@ cp -R artifacts/v7 artifacts/v8
 - `unseen_rules` turns on the post-decision rules of `src/unseen_rules.py` for
   countries absent from training.
 
-### Stage 4 and the v9 bundle
+### Stage 4 and the v9 bundle (submitted)
 
 `artifacts/v9` is the v8 bundle plus stage 4: a fine-tuned multilingual pair encoder
 (`encoder/`) and a LightGBM stacker (`stage4.txt`) that rescores the pairs whose decided
@@ -104,6 +111,10 @@ mkdir artifacts/v9 && cp artifacts/v8/*.* artifacts/v9/        # v8 without test
 .venv/bin/python -m src.cli predict --data DATA --model artifacts/v9 --out ../../output
 .venv/bin/python -m src.cli decide  --model artifacts/v9 --out ../../output_all --stage4-scope all
 ```
+
+`artifacts/v9` ships with `stage4_scope="seen"`. To ship `all` instead, run
+`configure --model artifacts/v9 --set 'stage4_scope="all"'` before zipping, so `predict`
+alone gives that output.
 
 `predict` encodes every active pair of every country (8.08M test pairs, about 40 minutes
 on the Apple GPU, on top of about 45 minutes for stages 1-3) and saves the logits with the
@@ -151,17 +162,20 @@ retrained encoder gives close but not identical logits.
 ### Files the submission zip needs
 
 `artifacts/` is not in git, so the submission zip must carry the bundle. `predict`
-needs these files of `artifacts/v8/`: `bundle.json`, `native_words.json`, every
+needs these files of `artifacts/v9/`: `bundle.json`, `native_words.json`, every
 `stage*_fold*.txt` (including `stage3_robust_fold*.txt`) and the three
 `vocab_*.parquet`. Leave out `oof.parquet` (error analysis only, 184 MB) and
 `test_scores/` (rewritten by `predict`, 1.2 GB). A bundle without the `vocab_*.parquet`
-files still loads but reads the leftover-token features at test-pool frequencies. The
-v9 bundle also needs `stage4.txt` and `encoder/` (`config.json`, `model.safetensors`,
-`tokenizer.json`, `tokenizer_config.json`). Check the unzipped copy:
+files still loads but reads the leftover-token features at test-pool frequencies. For
+stage 4 it also needs `stage4.txt` and `encoder/` (`config.json`, `model.safetensors`,
+`tokenizer.json`, `tokenizer_config.json`), about 560 MB in all. Check the unzipped copy:
 
 ```bash
 .venv/bin/python -c "from pathlib import Path; from src.pipeline import Bundle; \
-b = Bundle.load(Path('artifacts/v8')); assert b.vocab and b.config.unseen_rules; print('ok')"
+d = Path('artifacts/v9'); b = Bundle.load(d); assert b.vocab and b.config.unseen_rules; \
+assert b.stage4 and b.config.stage4_scope in ('seen', 'all'); \
+assert all((d / 'encoder' / f).is_file() for f in ('config.json', 'model.safetensors', \
+'tokenizer.json', 'tokenizer_config.json')); print('ok', b.config.stage4_scope)"
 ```
 
 Check the outputs with the challenge validator before uploading:
@@ -221,6 +235,9 @@ test set. Every stage logs its duration and peak memory.
 ```bash
 .venv/bin/python -m pytest
 ```
+
+69 tests: 67 pass and 2 skip unless the challenge validator is at
+`student_resource/utils/validate_submission.py` next to `code/` (then all 69 run).
 
 Covers normalisation (including transliteration and state names), the metric
 (the worked example in the problem statement, and the vectorised form against

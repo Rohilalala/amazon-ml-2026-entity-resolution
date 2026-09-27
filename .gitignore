@@ -1,14 +1,27 @@
+# Python
 .venv/
 __pycache__/
 .pytest_cache/
-artifacts/
+
+# Challenge data, model files and run outputs (never committed)
 student_resource/
-*.zip
-.DS_Store
-logs/
+dataset/
+artifacts/
+models/
 cache/
-output_v*/
-build/
-v5_lab/
-v7_lab/
-v8_lab/
+logs/
+output*/
+*.zip
+*.tsv
+*.parquet
+*.npy
+*.npz
+*.safetensors
+
+# Local experiment folders
+/build/
+/v5_lab/
+/v7_lab/
+/v8_lab/
+
+.DS_Store

@@ -58,6 +58,8 @@ def embed(model_dir: Path, records: pl.DataFrame, text: pl.Series, path: Path) -
 
 
 def _embed(model_dir: Path, texts: list, groups: list, path: Path, n: int) -> None:
+    """Child-process body of embed: tokenise and embed each group EMBED_CHUNK texts at a time and
+    write the vectors into the .npy memmap at `path`."""
     import torch
     from transformers import AutoModel, AutoTokenizer
     dev, _ = pair_encoder.device("auto")
@@ -111,6 +113,8 @@ def _knn(queries: np.ndarray, targets: np.ndarray, k: int) -> tuple[np.ndarray, 
     ar = torch.arange(G, device=dev)
 
     def topk_rows(s, k):
+        """Top-k values and column indices of each row of the score block `s`, searched inside the
+        k column groups with the largest maxima."""
         b, n = s.shape
         kg = min(k, n // G)
         gi = s.view(b, n // G, G).amax(-1).topk(kg, dim=1).indices
@@ -186,12 +190,14 @@ def new_pairs(nb: dict, cand: pl.DataFrame, country: str) -> pl.DataFrame:
 
 
 def sort_pairs(p: pl.DataFrame) -> pl.DataFrame:
+    """New pairs in list order: Source 1 row, source, cosine (highest first), candidate row."""
     return p.sort("s1_row", "source", "dense_cos", "j_row", descending=[False, False, True, False])
 
 
 # ---------------------------------------------------------------- 4. head
 
 def _split_text(col):
+    """Name and address expressions of a pair-text column ('name | address'), stripped."""
     s = pl.col(col).fill_null("").str.splitn(" | ", 2)
     return s.struct.field("field_0").fill_null("").str.strip_chars(), s.struct.field("field_1").fill_null("").str.strip_chars()
 
@@ -217,6 +223,7 @@ def head_features(df: pl.DataFrame, text: pl.Series) -> pl.DataFrame:
 
 
 def head_matrix(df: pl.DataFrame) -> np.ndarray:
+    """Head feature matrix (HEAD_FEATURES order, float32)."""
     return df.select(HEAD_FEATURES).cast(pl.Float32).to_numpy()
 
 
@@ -274,6 +281,7 @@ def train_head(F: pl.DataFrame, n_true: np.ndarray, kept0: np.ndarray, code: np.
 # ---------------------------------------------------------------- 5. decision (step B)
 
 def _append(base: pl.DataFrame, col: str, extra: pl.DataFrame) -> pl.DataFrame:
+    """`base` with the ids of `extra` (s1, jid) appended, sorted, to the list column `col` of their row."""
     e = extra.group_by("s1").agg(pl.col("jid").sort().str.join(",").alias("x"))
     return (base.join(e, on="s1", how="left", maintain_order="left")
             .with_columns(pl.when(pl.col("x").is_null()).then(pl.col(col))

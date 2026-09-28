@@ -138,6 +138,7 @@ def features_acnrst(df: pl.DataFrame, empty: np.ndarray, recs: pl.DataFrame) -> 
 
 
 def matrix(df: pl.DataFrame, names: list = FEATURES) -> np.ndarray:
+    """Feature matrix of `df` in the order of `names`, float32."""
     return df.select(names).cast(pl.Float32).to_numpy()
 
 

@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 
 
 def _default_lgb_params():
+    """LightGBM parameters shared by the three stages."""
     return {
         "objective": "binary",
         "learning_rate": 0.08,
@@ -44,6 +45,8 @@ def _default_ce_params():
 
 @dataclass(frozen=True)
 class Config:
+    """Every setting of a run: blocking, sampling and folds, LightGBM parameters, decision, unseen-country
+    and stage-4 options. Saved in bundle.json."""
     # Blocking: top-k Source 2 and top-k Source 3 records per Source 1 record,
     # top-k_rev Source 1 records per Source 2/3 record, and the document
     # frequency above which a blocking key is too common to use.
@@ -107,10 +110,12 @@ class Config:
     stage3_lgb_params: dict = field(default_factory=lambda: {"learning_rate": 0.05, "num_leaves": 63})
 
     def to_dict(self):
+        """Settings as a JSON-ready dict."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d):
+        """Settings from a dict written by to_dict."""
         return cls(**d)
 
     def lgb(self, stage: int = 1):

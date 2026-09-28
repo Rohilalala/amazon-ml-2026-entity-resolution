@@ -47,11 +47,13 @@ _DIGITS = re.compile(r"\d+\w*")
 
 
 def _norm(s: str | None) -> str:
+    """ASCII-folded, lowercased text; characters other than a-z, 0-9 and space become spaces."""
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
     return re.sub(r"[^a-z0-9 ]", " ", s)
 
 
 def _similar(a: str, b: str) -> bool:
+    """Two words are close (SequenceMatcher ratio >= 0.6): a typo rather than a different word."""
     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.6
 
 
@@ -76,6 +78,7 @@ def _has_street_type(a: str | None) -> bool:
 
 
 def _numbers(a: str | None) -> list:
+    """First three numbers of an address, as integers."""
     return [int(x) for x in re.findall(r"\d+", _norm(a))][:3]
 
 
@@ -94,6 +97,7 @@ def different_street(a1: str, a2: str) -> bool:
 
 
 def _france_pairs(sub: pl.DataFrame, recs: postprocess.TestRecords) -> list:
+    """(s1, m, Source 1 name, Source 1 address) of every France kept pair of `sub`."""
     s1 = recs.s1_of("france").select("entity_id", "business_name", pl.col("business_address").fill_null(""))
     S = {r[0]: (r[1], r[2]) for r in s1.iter_rows()}
     return [(a, b, *S[a]) for a, m in sub.select(S1, M).iter_rows() if a in S and m for b in m.split(",")]
@@ -106,6 +110,8 @@ def street_drops(sub: pl.DataFrame, recs: postprocess.TestRecords) -> pl.DataFra
 
 
 def _sister2_core(n: str | None) -> list:
+    """Name words of the sister2 rule: ASCII-folded, lowercased, dotted 's.a.r.l.' / 's.a.s.'
+    joined, legal forms removed."""
     s = unicodedata.normalize("NFKD", n or "").encode("ascii", "ignore").decode().lower()
     s = re.sub(r"\bs\.?\s?a\.?\s?r\.?\s?l\b\.?", "sarl", s)
     s = re.sub(r"\bs\.a\.s\.?(u)?\b", r"sas\1", s)
@@ -139,6 +145,7 @@ def sister2_drops(sub: pl.DataFrame, recs: postprocess.TestRecords) -> pl.DataFr
 
 
 def _kept_rows(sub: pl.DataFrame, ids: pl.DataFrame) -> pl.DataFrame:
+    """Kept pairs of `sub` as record rows (i, j), for the records in `ids` (row, entity_id)."""
     return (postprocess.pairs(sub).join(ids.rename({"entity_id": "s1", "row": "i"}), on="s1")
             .join(ids.rename({"entity_id": "m", "row": "j"}), on="m").select("i", "j"))
 
@@ -163,15 +170,18 @@ def _swap_last(a: list, b: list) -> str | None:
 
 
 def _house_int(h: str | None) -> int | None:
+    """Leading integer of a prepared house number, or None."""
     m = re.match(r"\d+", h or "")
     return int(m.group()) if m else None
 
 
 def _street_ratio(a1: str | None, a2: str | None) -> int:
+    """Token-set ratio of two addresses with their number words removed; -1 when the second is empty."""
     return int(fuzz.token_set_ratio(_DIGITS.sub(" ", a1 or ""), _DIGITS.sub(" ", a2 or ""))) if a2 else -1
 
 
 def _legal(n: str) -> list:
+    """Sorted legal forms among the words of a prepared name."""
     return sorted({t for t in n.split(" ") if t in LEGAL_FORMS})
 
 
@@ -200,6 +210,7 @@ def groupe_swap_adds(sub: pl.DataFrame, prep: pl.DataFrame, cand: pl.DataFrame) 
 
 
 def _name_parts(n: str | None) -> tuple:
+    """(words without legal forms, with 'et' and '&' read as 'and'; sorted legal forms) of a prepared name."""
     t = re.sub(r"[^a-z0-9& ]", " ", n or "").replace("&", " and ").split()
     return ["and" if x == "et" else x for x in t if x not in LEGAL_FORMS], sorted({x for x in t if x in LEGAL_FORMS})
 
@@ -305,6 +316,7 @@ _REGION_WORDS = {"nouvelle aquitaine", "hauts de france", "pays de la loire", "g
 
 
 def _fold(a: str) -> str:
+    """ASCII-folded (accents removed), lowercased text."""
     return "".join(ch for ch in unicodedata.normalize("NFKD", a) if not unicodedata.combining(ch)).lower()
 
 

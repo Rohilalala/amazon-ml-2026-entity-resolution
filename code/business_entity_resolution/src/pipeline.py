@@ -46,6 +46,7 @@ STAGE3_ACTIVE = 0.001
 # training, but decoy businesses in the test set come as copy groups that share
 # their difference too; the "robust" stage 3 is trained without these features.
 def robust_stage3_features(names: list[str]) -> list[str]:
+    """Stage-3 feature names of the robust variant: those without 'nov' or 'h_dev' in the name."""
     return [n for n in names if "nov" not in n and "h_dev" not in n]
 
 
@@ -74,6 +75,7 @@ def _cache_key(inputs: dict, cfg: Config) -> str:
 
 
 def _locale_rules(raw: pl.DataFrame) -> dict:
+    """Locale rules (locale_norm.learn) from the cleaned addresses of a split."""
     return locale_norm.learn(raw.select(
         pl.col("country").str.strip_chars().str.to_lowercase().alias("country_key"), "src",
         text.clean_address(raw["business_address"]).alias("addr")))
@@ -136,6 +138,7 @@ def build_matrix(recs, pairs, size, tables) -> tuple[np.ndarray, list[str]]:
 
 
 def matrix(frame: pl.DataFrame, names: list[str]) -> np.ndarray:
+    """Feature matrix of `frame` in the order of `names`, float32."""
     return frame.select(names).to_numpy().astype(np.float32, copy=False)
 
 
@@ -254,6 +257,7 @@ def decide(i: np.ndarray, j: np.ndarray, prob: np.ndarray, pair_country: np.ndar
         prob = np.where(prob >= top, prob, 0.0)
 
     def rule_of(c):
+        """Decision rule of a country: the stage-4 rule for stage-4 countries, else the bundle's."""
         return bundle.stage4_rule if c in stage4_countries else bundle.rule
     if len(stage4_countries):
         m4 = np.isin(pair_country, list(stage4_countries))
@@ -278,6 +282,7 @@ def decide(i: np.ndarray, j: np.ndarray, prob: np.ndarray, pair_country: np.ndar
         gi, pc, missed = i[m], prob[m], rule_of(c)["missed"]
 
         def mask(scale):
+            """Pairs the unseen country keeps at calibration scale `scale` (expected-F0.5 rule, positive probability)."""
             return expected_f05_mask(gi, pc, missed, scale) & (pc > 0)
         lo, hi = 1.0, float(cfg.unseen_none_cap)
         if share[c] >= target:
@@ -313,6 +318,8 @@ class Stage:
 
 @dataclass
 class Bundle:
+    """A trained model: settings, stage boosters, decision rules and report, plus the optional stage-3 variants,
+    stage 4, Indic dictionary and vocabulary tables; saved as bundle.json and model files."""
     config: Config
     stages: list[Stage]
     rule: dict
@@ -325,6 +332,7 @@ class Bundle:
     stage4_rule: dict | None = None
 
     def save(self, directory: Path) -> None:
+        """Write bundle.json, every model file, the Indic dictionary, oof.parquet and the vocabulary tables."""
         directory.mkdir(parents=True, exist_ok=True)
         stages = []
         for s, stage in enumerate(self.stages, 1):
@@ -359,11 +367,14 @@ class Bundle:
 
     @classmethod
     def load(cls, directory: Path) -> "Bundle":
+        """Read a bundle written by `save` (and by the import commands); DataError when files are
+        missing or do not match."""
         path = directory / BUNDLE_FILE
         if not path.is_file():
             raise data.DataError(f"no model bundle at {directory}; run `train` first")
         meta = json.loads(path.read_text())
         def stage(st):
+            """One stage's boosters from its model files, checked against its feature list."""
             boosters = [lgb.Booster(model_file=str(directory / f)) for f in st["models"]]
             if any(b.num_feature() != len(st["features"]) for b in boosters):
                 raise data.DataError(f"{directory}: model features do not match the bundle")
@@ -384,6 +395,7 @@ def stage4_files(n: int) -> list[str]:
 
 
 def save_vocab(directory: Path, vocab: dict) -> None:
+    """Write the training-pool vocabulary tables into a bundle folder."""
     for k, v in vocab.items():
         v.write_parquet(directory / VOCAB_FILE.format(k))
 
@@ -488,10 +500,12 @@ def score_all(recs: pl.DataFrame, pairs: pl.DataFrame, stages: list[Stage], size
 
 
 def _dict_hash(d: dict) -> str:
+    """Short sha256 of a dict's canonical JSON (cache and file keys)."""
     return hashlib.sha256(json.dumps(d, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _sha256(path: Path) -> str:
+    """sha256 of a file, read in 4 MB blocks."""
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for block in iter(lambda: fh.read(1 << 22), b""):
@@ -957,6 +971,7 @@ def select_probability(probs: dict, bundle: Bundle, pair_country: np.ndarray) ->
     """The probability each pair is decided on: the configured stage-3 choice, with
     per-country overrides (stage3_by_country) applied by the Source 1 record's country."""
     def column(choice):
+        """Probability column of a stage-3 choice ('none' = stage 2)."""
         key = "stage2" if choice == "none" else choice
         if key not in probs:
             raise data.DataError(f"stage-3 choice {choice!r} not available; have {sorted(probs)}")

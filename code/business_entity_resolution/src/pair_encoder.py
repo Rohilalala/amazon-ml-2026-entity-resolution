@@ -62,6 +62,7 @@ def device(choice: str = "auto") -> "tuple[torch.device, torch.dtype | None]":
 
 
 def _empty_cache(dev) -> None:
+    """Release the GPU allocator's cached memory (MPS or CUDA)."""
     import torch
     if dev.type == "mps":
         torch.mps.empty_cache()
@@ -70,6 +71,7 @@ def _empty_cache(dev) -> None:
 
 
 def _tokenize(tok, text: pl.Series, i: np.ndarray, j: np.ndarray, max_length: int) -> list[list[int]]:
+    """Token ids of the pairs (text[i], text[j]), the longer side truncated first to `max_length`."""
     return tok(text.gather(i).to_list(), text.gather(j).to_list(), truncation="longest_first",
                max_length=max_length)["input_ids"]
 
@@ -102,6 +104,7 @@ def _logits(model, ids: list[list[int]], pad_id: int, batch_size: int, dev, amp)
 
 
 def _child_logging() -> None:
+    """Logging setup of the spawned process (same format as the command line)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
@@ -129,6 +132,7 @@ def score(model_dir: Path, text: pl.Series, i: np.ndarray, j: np.ndarray, params
 
 
 def _score(model_dir: Path, text: pl.Series, i: np.ndarray, j: np.ndarray, params: dict) -> np.ndarray:
+    """Child-process body of score: load the encoder and score the pairs CHUNK at a time."""
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     dev, amp = device(params.get("device", "auto"))
     tok = AutoTokenizer.from_pretrained(model_dir)
@@ -162,6 +166,7 @@ def train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: pl
 
 
 def _train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: pl.DataFrame, params: dict):
+    """Child-process body of train: returns (report, validation logits)."""
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
     dev, amp = device(params.get("device", "auto"))

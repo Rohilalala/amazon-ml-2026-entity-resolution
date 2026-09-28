@@ -51,6 +51,7 @@ def post_chain(sub: pl.DataFrame, cands: pl.DataFrame, records: pl.DataFrame, ra
     c, rep["C_sister"] = postprocess.sister_filter(b, recs)
     d, rep["D_restore"] = postprocess.restore_scrambles(b, c, recs)
     def step(name, frame):
+        """(drops, adds, India copy sources) of step `name`: the shipped lists, or rules.derive on `frame`."""
         if derive is None:
             src = lists[name, "add"].filter(pl.col("src").is_not_null()).select("s1", "m", "src") if name == "F" else None
             return lists[name, "drop"], lists[name, "add"], src

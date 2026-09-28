@@ -39,11 +39,13 @@ log = logging.getLogger("ber")
 
 
 def _config(args) -> Config:
+    """Blocking and training settings from the command-line arguments."""
     return Config(k=args.k, k_rev=args.k_rev, max_df=args.max_df, train_s1_sample=args.sample,
                   folds=args.folds, seed=args.seed)
 
 
 def _train(args) -> pipeline.Bundle:
+    """Train stages 1-3 on the training split and save the bundle to --model."""
     bundle = pipeline.train(args.data, _config(args), country_check=not args.skip_country_check,
                             cache=args.cache)
     bundle.save(args.model)
@@ -51,6 +53,7 @@ def _train(args) -> pipeline.Bundle:
 
 
 def _predict(args, bundle=None) -> None:
+    """Predict the test split with a saved bundle (optionally with predict-time feature caps) and write the outputs."""
     bundle = bundle or pipeline.Bundle.load(args.model)
     if getattr(args, "feature_cap", None):
         caps = {k: float(v) for k, v in (item.split("=", 1) for item in args.feature_cap)}
@@ -157,6 +160,7 @@ def _adapt_labels(args) -> None:
     ids = records.select("row", "entity_id")
 
     def read(path):
+        """(s1, m) pairs of a matching_results.tsv."""
         return postprocess.pairs(data.read_tsv(path, ["source1_entity_id", data.MATCH_COLUMN]))
     decision = read(args.decision)
     neg = None
@@ -214,6 +218,7 @@ def _configure(args) -> None:
 
 
 def _write(args, matches, cands, report) -> None:
+    """Write matching_results.tsv and candidate_pairs.tsv to --out and the report into the bundle."""
     data.write_id_lists(args.out / "matching_results.tsv", data.MATCH_COLUMN, matches)
     data.write_id_lists(args.out / "candidate_pairs.tsv", data.CANDIDATE_COLUMN, cands)
     (args.model / "predict_report.json").write_text(json.dumps(report, indent=2))
@@ -221,6 +226,7 @@ def _write(args, matches, cands, report) -> None:
 
 
 def main(argv=None) -> int:
+    """Parse the command line and run one command; returns the exit code."""
     ap = argparse.ArgumentParser(prog="python -m src.cli", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)

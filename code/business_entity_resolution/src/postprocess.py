@@ -52,6 +52,7 @@ def _rebuild(sub: pl.DataFrame, ex: pl.DataFrame) -> pl.DataFrame:
 
 
 def _norm(s: str | None) -> str:
+    """ASCII-folded, lowercased text; characters other than a-z, 0-9 and space become spaces."""
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
     return re.sub(r"[^a-z0-9 ]", " ", s)
 
@@ -62,6 +63,7 @@ def core_words(name: str | None) -> list[str]:
 
 
 def _house(address: str | None) -> str | None:
+    """First number of an address without leading zeros, or None."""
     m = re.search(r"\b(\d+)\b", _norm(address))
     return str(int(m.group(1))) if m else None
 
@@ -70,6 +72,7 @@ class TestRecords:
     """Names, addresses and countries of the test records, by entity id (data.load_split order)."""
 
     def __init__(self, raw: pl.DataFrame):
+        """Index names and addresses by entity id and count France name words over Source 2/3."""
         country = raw["country"].str.strip_chars().str.to_lowercase()
         self.raw = raw.with_columns(country_key=country)
         s23 = self.raw.filter(pl.col("src") != 1)
@@ -82,6 +85,7 @@ class TestRecords:
         self.fr_freq = collections.Counter(t for n in fr["business_name"].to_list() for t in core_words(n))
 
     def s1_of(self, country: str) -> pl.DataFrame:
+        """Source 1 records of one country."""
         return self.raw.filter((pl.col("src") == 1) & (pl.col("country_key") == country))
 
 
@@ -137,6 +141,8 @@ def sister_filter(sub: pl.DataFrame, recs: TestRecords) -> tuple[pl.DataFrame, d
 
 
 def _scramble(recs: TestRecords, s: str, m: str) -> bool:
+    """Step D test: exactly one core word differs, and the candidate's word is a rare word with the
+    same first letter (a generator scramble) or one word is a prefix of the other."""
     d = [(a, b) for a, b in zip(core_words(recs.s1_name.get(s, "")), core_words(recs.name.get(m, ""))) if a != b]
     if len(d) != 1:
         return False

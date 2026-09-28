@@ -44,7 +44,7 @@ def post_chain(sub: pl.DataFrame, cands: pl.DataFrame, records: pl.DataFrame, ra
     `records`: row, entity_id, country_key, src of every test record; `raw`: data.load_split('test');
     `P`: recall new pairs with the head probability (s1_row, j_row, country, prob).
     `derive` ({"prep": prepared records, "cand": candidate pairs, "active": active pairs}): compute
-    the lists of steps E-G with rules.derive on the current frame instead of replaying `lists`."""
+    the lists of steps E-H with rules.derive on the current frame instead of replaying `lists`."""
     rep, t0 = {}, time.time()
     recs = postprocess.TestRecords(raw)
     b, cands, rep["B_recall"] = recall.apply(sub, cands, P, records, head_meta["t_keep"], head_meta["t_none"])
@@ -60,8 +60,8 @@ def post_chain(sub: pl.DataFrame, cands: pl.DataFrame, records: pl.DataFrame, ra
     for name in "EFG":
         drops, adds, src = step(name, frame)
         frame, rep[f"{name}_lists"] = postprocess.apply_lists(frame, drops, adds, sources=src, unique_adds=name == "G")
-    g = frame
-    h, rep["H_lists"] = postprocess.apply_late(g, lists["H", "drop"], lists["H", "add"])
+    drops, adds, _ = step("H", frame)
+    h, rep["H_lists"] = postprocess.apply_late(frame, drops, adds)
     log.info("post-decision chain in %.0fs: %s", time.time() - t0, rep)
     return h, cands, rep, {"after_recall": b, "after_sister": c}
 

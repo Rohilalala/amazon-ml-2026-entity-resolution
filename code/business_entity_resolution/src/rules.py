@@ -1,4 +1,4 @@
-"""The rules behind the pair lists of steps E-G (lists.parquet), as code over a decision.
+"""The rules behind the pair lists of steps E-H (lists.parquet), as code over a decision.
 
 Each function reads the test records and a submission frame (postprocess) and returns the pairs
 (s1, m) the rule drops or adds on that frame; postprocess.apply_lists then applies them with the

@@ -292,7 +292,7 @@ def main(argv=None) -> int:
     p.add_argument("--recall-pairs", type=Path, default=None,
                    help="score this saved recall new-pair list instead of retrieving (byte-exact leaderboard run)")
     p.add_argument("--derive-lists", action="store_true",
-                   help="compute the lists of steps E-G with src/rules.py on the current decision instead of replaying them")
+                   help="compute the lists of steps E-H with src/rules.py on the current decision instead of replaying them")
     p = sub.add_parser("check")
     p.add_argument("--data", type=Path, required=True, help="dataset/ folder")
     p.add_argument("--out", type=Path, required=True, help="folder with matching_results.tsv and candidate_pairs.tsv")

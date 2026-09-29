@@ -97,6 +97,7 @@ It holds:
 | `recall/encoder/`, `recall/head.txt`, `recall/head.json` | pair encoder and LightGBM head for the recall pairs |
 | `recall/new_pairs_leaderboard.parquet` | the recall new-pair list of the leaderboard run (see Reproducibility) |
 | `lists.parquet` | pair lists of post-decision steps E-H (7,797 rows) |
+| `adapt/round3/pseudo.parquet`, `anchor.parquet` | the labels round 3 of test-time adaptation learned from (see Reproducibility) |
 
 **Predict** (the leaderboard run):
 

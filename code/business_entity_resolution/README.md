@@ -220,7 +220,13 @@ Run it:
 It writes `matching_results.tsv` and `candidate_pairs.tsv` (the stage-1-3 candidates, the recall new
 pairs and every matched pair), checks the submission rules, and leaves the test scores, the recall
 pairs with their head probabilities and a report in the bundle (`test_scores/`, `predict_report.json`).
-Intermediate results are reused: a second run with the same bundle skips the recall scoring.
+Intermediate results are reused: a second run with the same bundle, test files and recall list skips
+the recall scoring. `check` re-reads the written files and checks the submission rules again,
+including one the official validator leaves out, that every matched id is also a candidate of its row:
+
+```bash
+.venv/bin/python -m src.cli check --data DATA --out ../../output
+```
 
 `--recall-pairs` scores a saved new-pair list instead of retrieving one. Without it, step B embeds
 every test record (written to `test_scores/embeddings.npy`, 9 GB, removed after the kNN) and builds
@@ -246,19 +252,24 @@ leaderboard run applied them:
 
 "Exact" means the function returns the shipped list when run on the decision named in the last
 column. Because each list was derived on an earlier decision, `rules.derive` (the same rules on the
-current frame) gives a slightly different chain; `final` replays the lists.
+current frame) gives a slightly different chain; `final` replays the lists, and `final --derive-lists`
+computes every list that has code on the current frame instead (the data-only lists are replayed).
+With steps E-H derived that way, 634 of the 1,732,544 rows differ from the leaderboard file
+(207 pairs more, 424 fewer; measured on the leaderboard run's saved stage-4 scores and recall list).
 
 Files the final bundle needs (about 1.6 GB; leave out `oof.parquet`, only used for training, and
 `test_scores/`, rewritten by every run): `bundle.json`, `native_words.json`, every `stage*_fold*.txt`,
-the three `vocab_*.parquet`, `encoder/`, `stage4_m0.txt` to `stage4_m2.txt`, `lists.parquet` and
-`recall/` (`retriever/`, `encoder/`, `head.txt`, `head.json`, `new_pairs_leaderboard.parquet`).
+the three `vocab_*.parquet`, `encoder/`, `stage4_m0.txt` to `stage4_m2.txt`, `lists.parquet`,
+`recall/` (`retriever/`, `encoder/`, `head.txt`, `head.json`, `new_pairs_leaderboard.parquet`) and
+`adapt/round3/` (`pseudo.parquet`, `anchor.parquet`: training input only, see below).
 Check an unzipped copy:
 
 ```bash
 .venv/bin/python -c "from pathlib import Path; from src.pipeline import Bundle; d = Path('artifacts/final'); \
 b = Bundle.load(d); assert b.config.stage4_scope == 'all' and len(b.stage4.boosters) == 3 and len(b.stage4.features) == 57; \
 assert all((d / p).is_file() for p in ('encoder/model.safetensors', 'lists.parquet', 'recall/head.txt', 'recall/head.json', \
-'recall/retriever/model.safetensors', 'recall/encoder/model.safetensors', 'recall/new_pairs_leaderboard.parquet')); print('ok')"
+'recall/retriever/model.safetensors', 'recall/encoder/model.safetensors', 'recall/new_pairs_leaderboard.parquet', \
+'adapt/round3/pseudo.parquet', 'adapt/round3/anchor.parquet')); print('ok')"
 ```
 
 ### Training the final models
@@ -317,8 +328,11 @@ learning-rate schedule that also advanced with elapsed time (75-minute budget); 
 pairs also excluded candidates of active holdout pairs, and v1's records came from a separate
 draw (top 8 candidates per record, fit filter rank <= 6 or true). Round 3's decision (the round-2
 final file) included 393 pairs restored by a step that no saved script reproduces; given the leaderboard
-run's own files, `adapt-labels` reproduces round 3's pseudo-labels and anchors exactly. Whether GPU
-training is bit-reproducible was not measured.
+run's own files, `adapt-labels` reproduces round 3's pseudo-labels and anchors exactly. Because that
+decision cannot be rebuilt, the bundle ships round 3's labels as data (`adapt/round3/pseudo.parquet`,
+`anchor.parquet`, the files round 3 trained on); `adapt-train --labels artifacts/final/adapt/round3`
+retrains round 3 from them, given the round-2 encoder (not in the bundle). Whether GPU training is
+bit-reproducible was not measured.
 
 ## Pipeline
 
@@ -356,6 +370,7 @@ Other commands:
     --stacker FILE.txt [--stacker FILE2.txt ...] --stacker-meta FILE.json   # add trained stage-4 files
 .venv/bin/python -m src.cli post-import --model artifacts/final ...   # recall models and rule lists
 .venv/bin/python -m src.cli final --data DATA --model artifacts/final --out OUT   # the leaderboard run
+.venv/bin/python -m src.cli check --data DATA --out OUT   # submission rules of written files, matches inside candidates
 .venv/bin/python -m src.cli encoder-train | recall-train | adapt-labels | adapt-train ...   # see above
 ```
 

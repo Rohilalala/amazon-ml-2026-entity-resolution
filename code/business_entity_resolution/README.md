@@ -27,7 +27,11 @@ every model is read from the bundle. `src/pair_encoder.py` sets `HF_HUB_OFFLINE=
 run was verified with (the watermarks cap the Apple GPU allocator cache, so a blow-up
 raises instead of swapping; none of them changes a number).
 
-## Reproduce end to end
+The leaderboard file (0.989667) comes from `final` on the final bundle: see
+[The leaderboard run](#the-leaderboard-run-final-bundle-0989667). The sections before it build
+the earlier bundles (v8, v9) that the final one grew from.
+
+## Train from scratch (stages 1-3)
 
 `DATA` is the challenge `dataset/` folder (it contains `train/` and `test/`).
 
@@ -39,8 +43,8 @@ This trains, validates, saves the model bundle to `artifacts/model/`, and writes
 `../../output/matching_results.tsv` and `../../output/candidate_pairs.tsv`.
 It uses the defaults in `src/config.py`, which save the training-pool vocabulary
 tables but leave the other predict-time corrections off (`feature_caps={}`,
-`unseen_rules=false`). The submitted outputs come from the v9 bundle below (the v8
-bundle plus stage 4).
+`unseen_rules=false`). The v8 and v9 bundles below add the corrections and stage 4;
+they were intermediate submissions, not the final one.
 
 The two stages can also run separately:
 
@@ -80,11 +84,11 @@ cp -R artifacts/v7 artifacts/v8
 - `unseen_rules` turns on the post-decision rules of `src/unseen_rules.py` for
   countries absent from training.
 
-### Stage 4 and the v9 bundle (submitted)
+### Stage 4 and the v9 bundle (an earlier submission)
 
 `artifacts/v9` is the v8 bundle plus stage 4: a fine-tuned multilingual pair encoder
-(`encoder/`) and a LightGBM stacker (`stage4.txt`) that rescores the pairs whose decided
-probability is at least `stage4_active` (0.002). The encoder reads the raw text of both
+(`encoder/`) and a LightGBM stacker (`stage4.txt`, feature set A) that rescores the pairs whose
+decided probability is at least `stage4_active` (0.002). The encoder reads the raw text of both
 records, `lower(business_name) | lower(business_address)`, accents and legal forms kept,
 and gives one match logit. The stacker's 8 features: the logit of the decided
 probability, the encoder logit, an empty-candidate-address flag, and for both scores the
@@ -112,9 +116,8 @@ mkdir artifacts/v9 && cp artifacts/v8/*.* artifacts/v9/        # v8 without test
 .venv/bin/python -m src.cli decide  --model artifacts/v9 --out ../../output_all --stage4-scope all
 ```
 
-`artifacts/v9` ships with `stage4_scope="seen"`. To ship `all` instead, run
-`configure --model artifacts/v9 --set 'stage4_scope="all"'` before zipping, so `predict`
-alone gives that output.
+`artifacts/v9` was saved with `stage4_scope="seen"`; after
+`configure --model artifacts/v9 --set 'stage4_scope="all"'`, `predict` alone gives the `all` output.
 
 `predict` encodes every active pair of every country (8.08M test pairs, about 40 minutes
 on the Apple GPU, on top of about 45 minutes for stages 1-3) and saves the logits with the
@@ -159,12 +162,12 @@ candidate appears in an active holdout pair (the holdout measured the gain: +0.0
 95% CI [0.00156, 0.00202], US and India). Whether GPU training is bit-reproducible was not
 measured, so expect a retrained encoder to give close, possibly not identical, logits.
 
-### Files the submission zip needs
+### Files the v9 bundle needs
 
-`artifacts/` is not in git, so the submission zip must carry the bundle. `predict`
-needs these files of `artifacts/v9/`: `bundle.json`, `native_words.json`, every
+`artifacts/` is not in git, and the v9 bundle is not distributed (the final bundle is, see
+below). `predict` needs these files of `artifacts/v9/`: `bundle.json`, `native_words.json`, every
 `stage*_fold*.txt` (including `stage3_robust_fold*.txt`) and the three
-`vocab_*.parquet`. Leave out `oof.parquet` (error analysis only, 184 MB) and
+`vocab_*.parquet`. Leave out `oof.parquet` (only training reads it, 184 MB) and
 `test_scores/` (rewritten by `predict`, 1.2 GB). A bundle without the `vocab_*.parquet`
 files still loads but reads the leftover-token features at test-pool frequencies. For
 stage 4 it also needs `stage4.txt` and `encoder/` (`config.json`, `model.safetensors`,
@@ -178,12 +181,15 @@ assert all((d / 'encoder' / f).is_file() for f in ('config.json', 'model.safeten
 'tokenizer.json', 'tokenizer_config.json')); print('ok', b.config.stage4_scope)"
 ```
 
-Check the outputs with the challenge validator before uploading:
+Check the outputs with the challenge validator (it comes with the challenge resources,
+`STUDENT_RESOURCE` below, and is not in this repository) before uploading, from this folder:
 
 ```bash
-python3 utils/validate_submission.py --matching output/matching_results.tsv \
-    --candidate output/candidate_pairs.tsv --test-dir dataset/test
+python3 STUDENT_RESOURCE/utils/validate_submission.py --matching ../../output/matching_results.tsv \
+    --candidate ../../output/candidate_pairs.tsv --test-dir DATA/test
 ```
+
+`src.cli check` (below) runs the same rules plus one the validator leaves out.
 
 ## The leaderboard run (final bundle, 0.989667)
 
@@ -191,36 +197,43 @@ python3 utils/validate_submission.py --matching output/matching_results.tsv \
 
 | Step | Module | What it does |
 |---|---|---|
-| A | `pipeline.predict` | stages 1-3 as in v8, then stage 4 in every country with the round-3 adapted encoder and the ACNRST stacker (57 features, 3 seed members averaged, rule expected F0.5 with `missed` 0), exclusive owner rule, France calibrated to the pinned empty share, `unseen_rules` |
-| B | `recall.py` | dense recall: pretrained multilingual-e5-small embeddings, exact kNN per country and source, new pairs by rule m1_r1_cap10, recall encoder logit + LightGBM head; adds at probability 0.80 (record keeps a pair) / 0.75 (keeps none) under the owner rule |
+| A | `pipeline.predict` | stages 1-3 as in v8, then stage 4 in every country with the round-3 adapted encoder and the ACNRST stacker (feature set A plus groups C, N, R, S, T: Source 1 context, same-address/name neighbours, relation codes, string similarities, text alignment; 57 features, 3 seed members averaged, rule expected F0.5 with `missed` 0), exclusive owner rule, France calibrated to the pinned empty share, `unseen_rules` |
+| B | `recall.py` | dense recall: pretrained multilingual-e5-small embeddings, exact kNN per country and source, new pairs by rule m1_r1_cap10 (a Source 1 record's best dense neighbour per source that is not already a candidate, or a reverse rank-1 pair; reverse-only pairs capped at 10 per record by cosine), recall encoder logit + LightGBM head; adds at probability 0.80 (record keeps a pair) / 0.75 (keeps none) under the owner rule |
 | C | `postprocess.sister_filter` | France sister-organisation decoys: one core word swapped for a common unrelated France word |
 | D | `postprocess.restore_scrambles` | re-adds C's drops that are generator typo scrambles or abbreviations |
 | E-H | `postprocess.apply_lists`, `apply_late` | the pair lists in `lists.parquet` (drops where present; adds only for unclaimed candidates of existing rows; India copies only while their source record is still kept) |
 
-Assembling the bundle from trained files (no retraining):
+How the shipped bundle was assembled from trained files, for reference: the bundle ships ready made,
+and the inputs named in capitals, the `ACNRST_*` stacker files, the head files, `lists.parquet` and the
+v9 bundle are lab files that are not distributed.
 
 ```bash
 mkdir artifacts/final && cp artifacts/v9/*.* artifacts/final/        # v9 without test_scores/ and encoder/
+rm artifacts/final/stage4.txt                                         # v9's single set-A stacker
 .venv/bin/python -m src.cli stage4-import --model artifacts/final --encoder ROUND3_ENCODER \
     --stacker ACNRST_s42.txt --stacker ACNRST_s7.txt --stacker ACNRST_s99.txt --stacker-meta ACNRST.json
-.venv/bin/python -m src.cli configure --model artifacts/final --set 'stage4_scope="all"' \
-    --set 'stage4_features="ACNRST"' --set 'stage4_seeds=[42, 7, 99]'
+.venv/bin/python -m src.cli configure --model artifacts/final --set 'stage4_scope="all"'
 .venv/bin/python -m src.cli post-import --model artifacts/final --retriever MULTILINGUAL_E5_SMALL \
     --recall-encoder V2_ENCODER --head head.txt --head-meta head.json --lists lists.parquet
-cp new_pairs_leaderboard.parquet artifacts/final/recall/
+cp new_pairs_leaderboard.parquet artifacts/final/recall/ && cp NOTICE artifacts/final/
 ```
+
+`stage4-import` sets `stage4_features` and, from the meta file's `seeds`, `stage4_seeds`. The
+`pair_list` and `ce` entries of the shipped `recall/head.json` are provenance notes; no code reads
+them.
 
 Run it:
 
 ```bash
-.venv/bin/python -m src.cli final --data DATA --model artifacts/final --out ../../output
+.venv/bin/python -m src.cli final --data DATA --model artifacts/final --out ../../output --cache CACHE
 ```
 
 It writes `matching_results.tsv` and `candidate_pairs.tsv` (the stage-1-3 candidates, the recall new
 pairs and every matched pair), checks the submission rules, and leaves the test scores, the recall
-pairs with their head probabilities and a report in the bundle (`test_scores/`, `predict_report.json`).
-Intermediate results are reused: a second run with the same bundle, test files and recall list skips
-the recall scoring. `check` re-reads the written files and checks the submission rules again,
+pairs with their head probabilities and a report in the bundle (`test_scores/`, `predict_report.json`;
+the report's `final` entry records whether the recall list was retrieved or given, and whether the
+lists were derived). Intermediate results are reused: a second run with the same bundle, test files,
+candidates and recall list skips the recall scoring. `check` re-reads the written files and checks the submission rules again,
 including one the official validator leaves out, that every matched id is also a candidate of its row:
 
 ```bash
@@ -228,28 +241,30 @@ including one the official validator leaves out, that every matched id is also a
 ```
 
 Step B embeds every test record (written to `test_scores/embeddings.npy`, 9 GB, removed after the
-kNN; 41 min with the kNN, 13.3 GB peak) and builds the list with the code's deterministic
+kNN; 41 min with the kNN, 13.3 GiB peak) and builds the list with the code's deterministic
 tie-breaking, which differs from the leaderboard run's list in 368 of 4,156,489 pairs (float16
 cosine ties at the reverse-only cap). On the leaderboard run's stage-4 scores, steps B-H with that
 list give the leaderboard `matching_results.tsv` byte for byte (none of the 368 pairs is added;
 the head probabilities of 278 other pairs of 62 records move by up to 0.035 and change no
-decision); `candidate_pairs.tsv` differs in the 368 ids. `--recall-pairs
+decision); `candidate_pairs.tsv` differs in the 368 ids (sha256 `95366357…`). `--recall-pairs
 artifacts/final/recall/new_pairs_leaderboard.parquet` scores the saved list instead of retrieving
-one, which reproduces the candidate file byte for byte too.
+one; the candidate file is then identical to the one of our leaderboard-list run (sha256
+`183f227831ccf191efd44250a0336fe1d21a1ee644fae5e4950514a61f3e7aee`). No candidate file was
+uploaded, and the lab's candidate file differs from both: it lacks 139 matched India ids.
 
 `lists.parquet` (columns step, action, rule, s1, m, src) holds the lists of steps E-H as the
 leaderboard run applied them:
 
 | Step | Rule | Rows | Code (`src/rules.py`) | Derived on |
 |---|---|---|---|---|
-| E drop | France same house number, different street | 992 | `street_drops` (exact) | round-1 decision after the sister filter |
+| E drop | France same house number, different street | 992 | `street_drops` (exact) | round-1 decision (test-time adaptation, step 5 below) after the sister filter |
 | E add | France last core word swapped for 'groupe' at the same address | 3,300 | `groupe_swap_adds` (exact) | same |
 | F add | France 'cie' written 'compagnie' | 628 | `cie_tailmid_adds` (exact) | round-2 final decision |
 | F add | France non-last word swapped for a final 'groupe' / 'france' | 1,306 | `cie_tailmid_adds` (exact) | same |
 | F add | India unscored pool copies of kept records (with their sources) | 140 | `india_copy_adds` (exact, sources too) | same |
 | G drop | France sister swap at any position | 612 | `sister2_drops` (exact) | round-1 decision |
 | G drop | generator source-cap excess copies | 12 | data only | round-2 final decision |
-| G drop | US state conflicts | 13 | `us_state_conflict_drops` (exact) | day-1 US decision |
+| G drop | US state conflicts | 13 | `us_state_conflict_drops` (exact) | the v7-final US decision (stages 1-3) |
 | G add | France 'groupe' copies of names without a legal form | 517 | data only | round-1 decision |
 | H drop | France region conflicts | 3 | `region_conflict_drops` (exact) | round-2 decision |
 | H drop | France near-tie ownership (both owners about equally likely) | 274 | data only: no saved builder; the closest rule (score margin <= 0.02, both >= 0.9) gives 287 | round-2 scores |
@@ -261,28 +276,35 @@ computes every list that has code on the current frame instead (the data-only li
 With steps E-H derived that way, 634 of the 1,732,544 rows differ from the leaderboard file
 (207 pairs more, 424 fewer; measured on the leaderboard run's saved stage-4 scores and recall list).
 
-Files the final bundle needs (about 1.6 GB; leave out `oof.parquet`, only used for training, and
-`test_scores/`, rewritten by every run): `bundle.json`, `native_words.json`, every `stage*_fold*.txt`,
-the three `vocab_*.parquet`, `encoder/`, `stage4_m0.txt` to `stage4_m2.txt`, `lists.parquet`,
-`recall/` (`retriever/`, `encoder/`, `head.txt`, `head.json`, `new_pairs_leaderboard.parquet`) and
-`adapt/round3/` (`pseudo.parquet`, `anchor.parquet`: training input only, see below).
-Check an unzipped copy:
+Files the final bundle needs (about 1.6 GB): `bundle.json`, `native_words.json`, every
+`stage*_fold*.txt`, the three `vocab_*.parquet`, `encoder/`, `stage4_m0.txt` to `stage4_m2.txt`,
+`lists.parquet`, `NOTICE`, `recall/` (`retriever/`, `encoder/`, `head.txt`, `head.json`, and
+optionally `new_pairs_leaderboard.parquet` for `--recall-pairs`) and `adapt/round3/`
+(`pseudo.parquet`, `anchor.parquet`: training input only, see below). Leave out `oof.parquet` (184 MB,
+read only by the training commands), `predict_report.json` and `test_scores/` (written by every run;
+a `test_scores/` from another run would let `final` reuse its cached recall list instead of
+retrieving). Check an unzipped copy:
 
 ```bash
 .venv/bin/python -c "from pathlib import Path; from src.pipeline import Bundle; d = Path('artifacts/final'); \
 b = Bundle.load(d); assert b.config.stage4_scope == 'all' and len(b.stage4.boosters) == 3 and len(b.stage4.features) == 57; \
-assert all((d / p).is_file() for p in ('encoder/model.safetensors', 'lists.parquet', 'recall/head.txt', 'recall/head.json', \
-'recall/retriever/model.safetensors', 'recall/encoder/model.safetensors', 'recall/new_pairs_leaderboard.parquet', \
-'adapt/round3/pseudo.parquet', 'adapt/round3/anchor.parquet')); print('ok')"
+assert all((d / p).is_file() for p in ('encoder/model.safetensors', 'lists.parquet', 'NOTICE', 'recall/head.txt', \
+'recall/head.json', 'recall/retriever/model.safetensors', 'recall/encoder/model.safetensors', \
+'adapt/round3/pseudo.parquet', 'adapt/round3/anchor.parquet')); \
+assert not any((d / p).exists() for p in ('test_scores', 'oof.parquet', 'predict_report.json')); print('ok')"
 ```
 
 ### Training the final models
 
-The order below reproduces how each shipped file was made; the time-based and data differences
-are listed after it. `DATA` is the dataset folder, `CACHE` a cache folder.
+The order below reproduces how each shipped file was made; where the commands differ from the runs
+that made the shipped files is listed after it. `DATA` is the dataset folder, `CACHE` a cache folder.
+Steps 2-4 read `oof.parquet`, the out-of-fold probabilities that step 1 (`train`) writes into its own
+bundle; the final bundle does not ship it, so copy it in first (`cp artifacts/model/oof.parquet
+artifacts/final/`). `stage4-train` checks that it covers the training sample of the bundle's
+settings; whether a fresh `train` writes the file the shipped models were trained on was not checked.
 
 1. Stages 1-3 and the v8 corrections: `train`, `vocab`, `configure` (see above).
-2. Pair encoder v1 and the set-A stacker: `stage4-train --base multilingual-e5-small`
+2. Pair encoder v1 and the set-A stacker (the 8 features of v9): `stage4-train --base multilingual-e5-small`
    (360k fresh training records, lr 3e-5).
 3. Encoder v2 from v1 on 300,000 further fresh records, then v3 from v2 on all remaining ones
    (lr 2e-5 each, one pass; each run saves the records it drew, and `--exclude` skips them):
@@ -296,20 +318,28 @@ are listed after it. `DATA` is the dataset folder, `CACHE` a cache folder.
    (5-fold cross-validation grouped by Source 1 record per seed, rule chosen on the averaged
    out-of-fold probability, one refit per seed).
 5. Test-time adaptation, three rounds (`src/adapt.py`). Round r starts from round r-1's encoder
-   (round 1 from v3) and learns from round r-1's own test run: round 1 from the stage-4 decision of
-   v3 (`predict` output, before recall and rules), rounds 2 and 3 from the full `final` output.
-   `final` also saves the frames after steps B and C (`test_scores/after_recall.tsv`,
-   `after_sister.tsv`), which name the pairs a filter removed (`--negatives-from AFTER_RECALL:AFTER_SISTER`
-   for "removed by the sister filter", `--negatives-from AFTER_RECALL` for "removed by any later step"):
+   (round 1 from v3) and learns from a decision of round r-1's own test run (`--decision`):
+
+   | Round | Decision it learned from | How to get it |
+   |---|---|---|
+   | 1 | v3's stage-4 decision, before recall and rules | `predict` on the v3 bundle (its `matching_results.tsv`) |
+   | 2 | round 1's steps A-C: stage 4, recall adds, sister filter | `final` on the round-1 bundle saves it as `test_scores/after_sister.tsv` |
+   | 3 | round 2's steps A-C, then step E and 393 pairs restored by a step no saved script reproduces | cannot be rebuilt; round 3's labels ship as data (below) |
+
+   `final`'s own output cannot stand in for these decisions: it runs steps D-H, and the shipped
+   lists of E-H were derived on later decisions, so later rounds' rules would leak into earlier
+   rounds' labels. `final` also saves the frame after step B (`test_scores/after_recall.tsv`), so
+   `--negatives-from AFTER_RECALL:AFTER_SISTER` names the pairs the sister filter removed:
 
    ```bash
-   .venv/bin/python -m src.cli final --data DATA --model PREV --out PREV_OUT            # previous round's decision
-   .venv/bin/python -m src.cli adapt-labels --data DATA --model PREV --decision PREV_OUT/matching_results.tsv \
-       --negatives-from BEFORE_FILTER.tsv[:AFTER_FILTER.tsv] --drop-scrambles --anchor-pool ENCODER_FIT_PAIRS.parquet \
-       --round 3 --out LABELS
+   .venv/bin/python -m src.cli final --data DATA --model PREV --out PREV_OUT   # writes PREV/test_scores/after_*.tsv
+   .venv/bin/python -m src.cli adapt-labels --data DATA --model PREV --decision PREV/test_scores/after_sister.tsv \
+       --negatives-from PREV/test_scores/after_recall.tsv:PREV/test_scores/after_sister.tsv \
+       --anchor-pool ENCODER_FIT_PAIRS.parquet --round 2 --out LABELS
    .venv/bin/python -m src.cli adapt-train --data DATA --model PREV --init PREV/encoder --labels LABELS --out ROUND_ENCODER
    ```
-   then step 4 on the new encoder. Pseudo-labels: pos = kept and stage-4 probability >= 0.98;
+   (round 2 shown; round 1 takes `--decision` from `predict` and no negatives), then step 4 on the
+   new encoder. Pseudo-labels: pos = kept and stage-4 probability >= 0.98;
    hard = per Source 1 record the 2 unkept candidates with the highest encoder logit among those
    <= 0.05; easy = other pairs <= 0.02; sister = pairs a post-decision filter removed (label 0).
    55% pos / 22.5% hard / 22.5% easy per country, 10% of the sampled records held out; anchors are
@@ -327,16 +357,29 @@ are listed after it. `DATA` is the dataset folder, `CACHE` a cache folder.
    the matcher's sample and holdout, their new pairs, labels from the ground truth, 5-fold CV, then
    (t_keep, t_none) on a grid by the macro F0.5 of the combined decision).
 
-Differences between these commands and the runs that made the shipped files: v1 and v2 used a
-learning-rate schedule that also advanced with elapsed time (75-minute budget); their training
-pairs also excluded candidates of active holdout pairs, and v1's records came from a separate
-draw (top 8 candidates per record, fit filter rank <= 6 or true). Round 3's decision (the round-2
-final file) included 393 pairs restored by a step that no saved script reproduces; given the leaderboard
-run's own files, `adapt-labels` reproduces round 3's pseudo-labels and anchors exactly. Because that
-decision cannot be rebuilt, the bundle ships round 3's labels as data (`adapt/round3/pseudo.parquet`,
-`anchor.parquet`, the files round 3 trained on); `adapt-train --labels artifacts/final/adapt/round3`
-retrains round 3 from them, given the round-2 encoder (not in the bundle). Whether GPU training is
-bit-reproducible was not measured.
+Differences between these commands and the runs that made the shipped files:
+
+- v1 and v2 used a learning-rate schedule that also advanced with elapsed time (75-minute budget).
+- v1, v2 and v3 dropped training pairs whose candidate belongs to an active holdout pair;
+  `stage4-train` and `encoder-train` drop only candidates of active sample pairs.
+- v2 and v3 also skipped v1's 360,000 training records; `stage4-train` saves no `s1_draw.parquet`,
+  so `encoder-train --exclude` cannot skip them.
+- v1's records came from a separate draw (top 8 candidates per record, fit filter rank <= 6 or true).
+- Validation: the lab runs checked the AUC on 8,192 random validation pairs, and v3 drew its
+  validation records with seed 31; `encoder-train` uses every validation pair and draws the records
+  with seed + 1 (32 for `--seed 31`; for v2, 22 as in the lab).
+- Batch order: v1-v3 shuffled pairs and batches with two generators seeded alike, the adaptation
+  rounds with one stream; the commands do the same (`pair_encoder._streams`).
+- The stage-4 stacker trains on 8 LightGBM threads, as the shipped members did; whether another
+  thread count changes them was not measured.
+
+So `encoder-train` does not rebuild v3's fit set, and the anchors of `adapt-labels` match round 3's
+only with the lab's v3 fit set as `--anchor-pool`. With the leaderboard run's own input files,
+`adapt-labels` was measured to reproduce round 3's pseudo-labels and anchors exactly. Round 3's
+decision cannot be rebuilt (above), so the bundle ships round 3's labels as data
+(`adapt/round3/pseudo.parquet`, `anchor.parquet`, the files round 3 trained on);
+`adapt-train --labels artifacts/final/adapt/round3` retrains round 3 from them, given the round-2
+encoder (not in the bundle). Whether GPU training is bit-reproducible was not measured.
 
 ## Pipeline
 
@@ -398,8 +441,9 @@ test set. Every stage logs its duration and peak memory.
 .venv/bin/python -m pytest
 ```
 
-90 tests: 88 pass and 2 skip unless the challenge validator is at
-`student_resource/utils/validate_submission.py` next to `code/` (then all 90 run).
+96 tests: 93 pass and 3 skip unless the challenge validator is at
+`student_resource/utils/validate_submission.py` next to `code/` (then all 96 run; those 3 are the
+only tests that run the validator).
 
 Covers normalisation (including transliteration and state names), the metric
 (the worked example in the problem statement, and the vectorised form against
@@ -417,7 +461,10 @@ against hand-computed values and their Source 1 bucketing, the sister filter, sc
 and list semantics of steps C-H, each list rule on a small example, the recall pair rule, add
 decision and kNN exactness, pseudo-label classes, quotas and determinism, and `final` end to end
 on the generated dataset (ACNRST stacker with two seed members, tiny encoders as retriever and
-recall encoder), which passes the validator and gives the same bytes with `--recall-pairs`, plus
+recall encoder), which passes the validator when present and gives the same bytes with
+`--recall-pairs`, the routing of each rule to its step in `--derive-lists`, kNN exactness with the
+column-group pruning in use, the training shuffle streams, `stage4-import` of seed members, input
+checks of `post-import` and `--recall-pairs`, plus
 `encoder-train` (disjoint draws), `recall-train`, and `check` (a matched id missing from its row's
 candidates fails; the written candidates hold every match, list adds included).
 

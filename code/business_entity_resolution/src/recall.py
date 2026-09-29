@@ -33,6 +33,8 @@ RETRIEVER_DIR, ENCODER_DIR, HEAD_FILE, HEAD_META = "retriever", "encoder", "head
 EMBED_CHUNK, EMBED_BATCH = 200_000, 512
 K_FORWARD, K_REVERSE = 20, 3
 FORWARD_NEW_RANK, REVERSE_RANK, REVERSE_CAP = 1, 1, 10
+# Columns of a new-pair list (new_pairs; a saved list passed to `final --recall-pairs` needs them).
+NEW_PAIR_COLUMNS = ["s1_row", "j_row", "dense_cos", "dense_rank", "new_rank", "rev_rank", "source", "country"]
 KNN_QUERY_BLOCK, KNN_TARGET_BLOCK, KNN_GROUP = 2048, 131072, 128
 HEAD_FEATURES = ["ce", "ce_rank", "ce_gap", "cos", "cos_gap", "drank", "nrank", "rrank", "rev_only", "src", "n_new",
                  "e_name_i", "e_addr_i", "e_name_j", "e_addr_j", "name_ratio", "name_tset", "addr_ratio", "addr_tset"]
@@ -280,15 +282,6 @@ def train_head(F: pl.DataFrame, n_true: np.ndarray, kept0: np.ndarray, code: np.
 
 # ---------------------------------------------------------------- 5. decision (step B)
 
-def _append(base: pl.DataFrame, col: str, extra: pl.DataFrame) -> pl.DataFrame:
-    """`base` with the ids of `extra` (s1, jid) appended, sorted, to the list column `col` of their row."""
-    e = extra.group_by("s1").agg(pl.col("jid").sort().str.join(",").alias("x"))
-    return (base.join(e, on="s1", how="left", maintain_order="left")
-            .with_columns(pl.when(pl.col("x").is_null()).then(pl.col(col))
-                          .when(pl.col(col) == "").then(pl.col("x"))
-                          .otherwise(pl.col(col) + "," + pl.col("x")).alias(col)).drop("x"))
-
-
 def apply(sub: pl.DataFrame, cands: pl.DataFrame, P: pl.DataFrame, records: pl.DataFrame, t_keep: float,
           t_none: float) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Step B. `sub` / `cands`: submission frames of matches and candidates (postprocess.S1, M);
@@ -302,7 +295,7 @@ def apply(sub: pl.DataFrame, cands: pl.DataFrame, P: pl.DataFrame, records: pl.D
     assert best["s1_row"].null_count() == 0 and (best["src"] == 1).all()
     best = best.drop("src").with_row_index("code")
     kept_ids = best.select("s1", pl.col("m").str.split(",")).explode("m").filter(pl.col("m") != "")["m"].unique()
-    P = (P.join(best.select("s1_row", "code", "s1", has_keep=pl.col("m") != ""), on="s1_row", how="left", maintain_order="left")
+    P = (P.join(best.select("s1_row", "code", "s1"), on="s1_row", how="left", maintain_order="left")
          .join(ids.select(pl.col("row").alias("j_row"), pl.col("entity_id").alias("jid")), on="j_row", how="left",
                maintain_order="left"))
     assert P["code"].null_count() == 0 and P["jid"].null_count() == 0
@@ -311,8 +304,8 @@ def apply(sub: pl.DataFrame, cands: pl.DataFrame, P: pl.DataFrame, records: pl.D
     add = add_new(P["code"].to_numpy(), P["j_row"].to_numpy(), P["prob"].to_numpy(), thr_by_s1, taken)
     A = P.filter(pl.Series(add))
     assert A["jid"].n_unique() == A.height
-    res = _append(best.select("s1", "m"), "m", A)
-    cres = _append(cands.select(pl.col(S1).alias("s1"), pl.col(M).fill_null("").alias("m")), "m", P)
+    res = postprocess.append_sorted(best.select("s1", "m"), "m", A, "jid")
+    cres = postprocess.append_sorted(cands.select(pl.col(S1).alias("s1"), pl.col(M).fill_null("").alias("m")), "m", P, "jid")
     by_country = dict(A.group_by("country").len().iter_rows())
     return (res.rename({"s1": S1, "m": M}), cres.rename({"s1": S1, "m": M}),
             {"new_pairs": P.height, "added": A.height, "added_by_country": by_country, "t_keep": t_keep, "t_none": t_none})

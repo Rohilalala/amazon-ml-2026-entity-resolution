@@ -41,15 +41,14 @@ STREET_STOP = {"rue", "r", "avenue", "av", "ave", "boulevard", "bd", "blvd", "bo
                "allee", "all", "chemin", "chem", "route", "rte", "quai", "q", "cours", "crs", "square", "sq", "street", "st",
                "road", "rd", "drive", "dr", "lane", "ln", "court", "ct", "circle", "cir", "way", "trail", "trl", "de", "du",
                "des", "la", "le", "l", "d", "bis", "ter", "no", "n", "unit", "apartment", "saint", "sainte"}
-REGION_WORDS = {"hauts", "france", "pays", "loire", "nouvelle", "aquitaine", "nord", "gironde", "atlantique", "calais"}
-LEGAL_FORMS = {"sarl", "sas", "sasu", "sa", "eurl", "snc", "sci", "scop", "selarl", "ei"}
+# Single words of France region names, left out of whole-address street words (_street_words).
+STREET_REGION_WORDS = {"hauts", "france", "pays", "loire", "nouvelle", "aquitaine", "nord", "gironde", "atlantique", "calais"}
+# postprocess.LEGAL_FORMS plus "ei" (entreprise individuelle), for the name rules of steps E-G.
+LEGAL_FORMS_EI = postprocess.LEGAL_FORMS | {"ei"}
 _DIGITS = re.compile(r"\d+\w*")
 
 
-def _norm(s: str | None) -> str:
-    """ASCII-folded, lowercased text; characters other than a-z, 0-9 and space become spaces."""
-    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
-    return re.sub(r"[^a-z0-9 ]", " ", s)
+_norm = postprocess._norm
 
 
 def _similar(a: str, b: str) -> bool:
@@ -62,7 +61,7 @@ def _street_words(a: str | None, component_only: bool) -> list | None:
     or of the whole address (minus region words) when not `component_only`."""
     if not component_only:
         return [t for t in _norm(a).split() if not re.search(r"\d", t) and t not in STREET_STOP and len(t) >= 4
-                and t not in REGION_WORDS]
+                and t not in STREET_REGION_WORDS]
     for p in (a or "").split(","):
         if re.search(r"\d", p):
             return [t for t in _norm(p).split() if not re.search(r"\d", t) and t not in STREET_STOP and len(t) >= 4]
@@ -115,7 +114,7 @@ def _sister2_core(n: str | None) -> list:
     s = unicodedata.normalize("NFKD", n or "").encode("ascii", "ignore").decode().lower()
     s = re.sub(r"\bs\.?\s?a\.?\s?r\.?\s?l\b\.?", "sarl", s)
     s = re.sub(r"\bs\.a\.s\.?(u)?\b", r"sas\1", s)
-    return [t for t in re.sub(r"[^a-z0-9 ]", " ", s).split() if t not in LEGAL_FORMS]
+    return [t for t in re.sub(r"[^a-z0-9 ]", " ", s).split() if t not in LEGAL_FORMS_EI]
 
 
 def sister2_swap(n1: str, n2: str, freq: collections.Counter) -> bool:
@@ -182,7 +181,7 @@ def _street_ratio(a1: str | None, a2: str | None) -> int:
 
 def _legal(n: str) -> list:
     """Sorted legal forms among the words of a prepared name."""
-    return sorted({t for t in n.split(" ") if t in LEGAL_FORMS})
+    return sorted({t for t in n.split(" ") if t in LEGAL_FORMS_EI})
 
 
 def groupe_swap_adds(sub: pl.DataFrame, prep: pl.DataFrame, cand: pl.DataFrame) -> pl.DataFrame:
@@ -212,7 +211,7 @@ def groupe_swap_adds(sub: pl.DataFrame, prep: pl.DataFrame, cand: pl.DataFrame) 
 def _name_parts(n: str | None) -> tuple:
     """(words without legal forms, with 'et' and '&' read as 'and'; sorted legal forms) of a prepared name."""
     t = re.sub(r"[^a-z0-9& ]", " ", n or "").replace("&", " and ").split()
-    return ["and" if x == "et" else x for x in t if x not in LEGAL_FORMS], sorted({x for x in t if x in LEGAL_FORMS})
+    return ["and" if x == "et" else x for x in t if x not in LEGAL_FORMS_EI], sorted({x for x in t if x in LEGAL_FORMS_EI})
 
 
 def cie_tailmid_rule(n1: str, n2: str) -> str | None:
@@ -311,7 +310,8 @@ REGIONS = {"nouvelle aquitaine": "NA", "gironde": "NA", "hauts de france": "HF",
 REGION_CITIES = {"bordeaux": "NA", "pessac": "NA", "merignac": "NA", "la teste de buch": "NA", "lege cap ferret": "NA",
                  "nantes": "PL", "saint nazaire": "PL", "pornic": "PL", "saint herblain": "PL", "la baule escoublac": "PL",
                  "lille": "HF", "tourcoing": "HF", "dunkerque": "HF", "roubaix": "HF", "calais": "HF"}
-_REGION_WORDS = {"nouvelle aquitaine", "hauts de france", "pays de la loire", "gironde", "nord", "pas de calais",
+# Comma parts that name a region (or the country), never a city (region()).
+REGION_NAMES = {"nouvelle aquitaine", "hauts de france", "pays de la loire", "gironde", "nord", "pas de calais",
                  "loire atlantique", "france"}
 
 
@@ -335,7 +335,7 @@ def region(a: str | None) -> str | None:
         c = re.sub(r"\bst\b", "saint", c)
         c = re.sub(r"\bste\b", "sainte", c)
         c = re.sub(r"\s+", " ", re.sub(r"\d{5}", "", c)).strip()
-        if c and c not in _REGION_WORDS and not re.search(r"\d", c):
+        if c and c not in REGION_NAMES and not re.search(r"\d", c):
             cities.append(c)
     return REGION_CITIES.get(cities[-1]) if cities else None
 
@@ -352,8 +352,8 @@ def region_conflict_drops(sub: pl.DataFrame, recs: postprocess.TestRecords) -> p
 
 def derive(step: str, sub: pl.DataFrame, recs: postprocess.TestRecords, prep: pl.DataFrame, cand: pl.DataFrame,
            active: pl.DataFrame, recall_pairs: pl.DataFrame, shipped: dict) -> tuple:
-    """(drops, adds, sources) of one step computed on the current frame; lists without code come
-    from `shipped` ({(step, action): frame})."""
+    """(drops, adds, sources) of step E, F, G or H computed on the current frame; lists without code
+    come from `shipped` ({(step, action): frame})."""
     empty = pl.DataFrame(schema={"s1": pl.String, "m": pl.String})
     if step == "E":
         return street_drops(sub, recs), groupe_swap_adds(sub, prep, cand), None
@@ -365,7 +365,6 @@ def derive(step: str, sub: pl.DataFrame, recs: postprocess.TestRecords, prep: pl
         rest = shipped["G", "drop"].filter(~pl.col("rule").is_in(["sister2", "stateconf"])).select("s1", "m")
         return (pl.concat([sister2_drops(sub, recs), us_state_conflict_drops(sub, prep), rest]),
                 shipped["G", "add"].select("s1", "m"), None)
-    if step == "H":
-        rest = shipped["H", "drop"].filter(pl.col("rule") != "fr_region_conflict").select("s1", "m")
-        return pl.concat([region_conflict_drops(sub, recs), rest]), shipped["H", "add"].select("s1", "m"), None
-    return shipped[step, "drop"], shipped[step, "add"], None
+    assert step == "H", step
+    rest = shipped["H", "drop"].filter(pl.col("rule") != "fr_region_conflict").select("s1", "m")
+    return pl.concat([region_conflict_drops(sub, recs), rest]), shipped["H", "add"].select("s1", "m"), None

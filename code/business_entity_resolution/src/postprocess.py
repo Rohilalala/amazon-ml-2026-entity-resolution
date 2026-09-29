@@ -12,7 +12,10 @@ Steps (the leaderboard run, `final.py`):
   E-H apply_lists         pair lists of the later France / India / US rules (lists.parquet in
                           the bundle; see rules.py for the code that derives each list).
 Shared semantics of every add: applied only if the Source 1 row exists and the candidate is kept
-by no Source 1 record in the current frame; drops apply where present.
+by no Source 1 record in the current frame; drops apply where present. "Current frame" differs by
+step when a list drops a pair and re-adds its candidate elsewhere: steps E and G check the frame
+after the step's drops (the candidate is free again), steps F and H the frame before them (it
+is not), as in the lab scripts that made the leaderboard file; tests/test_final.py pins it.
 """
 import collections
 import difflib
@@ -51,6 +54,16 @@ def _rebuild(sub: pl.DataFrame, ex: pl.DataFrame) -> pl.DataFrame:
     return out
 
 
+def append_sorted(base: pl.DataFrame, col: str, extra: pl.DataFrame, id_col: str) -> pl.DataFrame:
+    """`base` (s1, `col`) with the ids of `extra` (s1, `id_col`) appended, sorted, to the list
+    column `col` of their row; `base` keeps its row order."""
+    e = extra.group_by("s1").agg(pl.col(id_col).sort().str.join(",").alias("x"))
+    return (base.join(e, on="s1", how="left", maintain_order="left")
+            .with_columns(pl.when(pl.col("x").is_null()).then(pl.col(col))
+                          .when(pl.col(col) == "").then(pl.col("x"))
+                          .otherwise(pl.col(col) + "," + pl.col("x")).alias(col)).drop("x"))
+
+
 def _norm(s: str | None) -> str:
     """ASCII-folded, lowercased text; characters other than a-z, 0-9 and space become spaces."""
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
@@ -60,12 +73,6 @@ def _norm(s: str | None) -> str:
 def core_words(name: str | None) -> list[str]:
     """ASCII-folded, lowercased name words without French legal forms."""
     return [t for t in _norm(name).split() if t not in LEGAL_FORMS]
-
-
-def _house(address: str | None) -> str | None:
-    """First number of an address without leading zeros, or None."""
-    m = re.search(r"\b(\d+)\b", _norm(address))
-    return str(int(m.group(1))) if m else None
 
 
 class TestRecords:
@@ -167,9 +174,10 @@ def restore_scrambles(pre: pl.DataFrame, post: pl.DataFrame, recs: TestRecords) 
 def apply_lists(sub: pl.DataFrame, drops: pl.DataFrame, adds: pl.DataFrame, sources: pl.DataFrame | None = None,
                 unique_adds: bool = False) -> tuple[pl.DataFrame, dict]:
     """Steps E-G. Remove `drops` (s1, m) where present; append each add (s1, m), in list order, when
-    its Source 1 row exists and m is kept by no Source 1 record. `sources` (s1, m, src list): an add
-    listed there also needs the frame to still keep one of its source records for that s1 (India
-    copies). `unique_adds`: keep only the first add of each m."""
+    its Source 1 row exists and m is kept by no Source 1 record: after the drops without `sources`
+    (E, G), before them with `sources` (F). `sources` (s1, m, src list): an add listed there also
+    needs the frame to still keep one of its source records for that s1 (India copies).
+    `unique_adds`: keep only the first add of each m."""
     b = pairs(sub)
     assert b["m"].is_unique().all(), "a candidate is kept twice"
     kept = b.join(drops.select("s1", "m"), on=["s1", "m"], how="anti")
@@ -177,19 +185,22 @@ def apply_lists(sub: pl.DataFrame, drops: pl.DataFrame, adds: pl.DataFrame, sour
     if sources is None:
         ok = adds.filter(~pl.col("m").is_in(kept["m"].implode()) & pl.col("s1").is_in(sub[S1].implode()))
         if unique_adds:
-            ok = ok.unique(subset=["m"], keep="first")
+            ok = ok.unique(subset=["m"], keep="first", maintain_order=True)
     else:
         ok = adds.filter(pl.col("s1").is_in(sub[S1].implode()) & ~pl.col("m").is_in(b["m"].implode()))
         src = sources.explode("src")
         held = src.join(b.rename({"m": "src"}), on=["s1", "src"]).select("s1", "m").unique()
-        ok = pl.concat([ok.join(src.select("s1", "m").unique(), on=["s1", "m"], how="anti"), ok.join(held, on=["s1", "m"])])
+        # both parts in list order (a join's row order is otherwise unspecified)
+        ok = pl.concat([ok.join(src.select("s1", "m").unique(), on=["s1", "m"], how="anti", maintain_order="left"),
+                        ok.join(held, on=["s1", "m"], maintain_order="left")])
     ex = pl.concat([kept, ok])
     assert ex["m"].is_unique().all(), "a candidate is kept by two Source 1 records"
     return _rebuild(sub, ex), {"dropped": b.height - kept.height, "added": ok.height}
 
 
 def apply_late(sub: pl.DataFrame, drops: pl.DataFrame, adds: pl.DataFrame) -> tuple[pl.DataFrame, dict]:
-    """Step H: apply_lists semantics with plain per-row lists (adds appended to their row)."""
+    """Step H: plain per-row lists (adds appended to their row); an add needs its candidate kept by
+    no Source 1 record before the drops, as apply_lists with `sources`."""
     rows = sub[S1].to_list()
     ms = [[m for m in (x or "").split(",") if m] for x in sub[M].to_list()]
     drop = set(drops.select("s1", "m").iter_rows())

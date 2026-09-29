@@ -9,10 +9,12 @@
      apply_late; rules.py derives each list).
 
 Bundle layout (artifacts/final): the v9 bundle files (stages 1-3, config, vocabulary tables)
-with encoder/ = the round-3 adapted pair encoder and stage4_s*.txt = the stacker's seed members;
-recall/ = retriever/ (pretrained e5-small), encoder/ (v2 pair encoder), head.txt, head.json;
+with encoder/ = the round-3 adapted pair encoder and stage4_m*.txt = the stacker's seed members;
+recall/ = retriever/ (pretrained e5-small), encoder/ (v2 pair encoder), head.txt, head.json and
+new_pairs_leaderboard.parquet (the leaderboard run's saved new-pair list, for --recall-pairs);
 lists.parquet. Intermediate test results are saved under <bundle>/test_scores/ and reused.
 """
+import hashlib
 import json
 import logging
 import time
@@ -28,6 +30,7 @@ log = logging.getLogger(__name__)
 
 RECALL_DIR, LISTS_FILE = "recall", "lists.parquet"
 RECALL_BATCH = 512  # pair-encoder batch the recall head's logits were computed with
+RECALL_MAX_LENGTH = 128
 
 
 def load_lists(bundle_dir: Path) -> dict:
@@ -69,14 +72,10 @@ def post_chain(sub: pl.DataFrame, cands: pl.DataFrame, records: pl.DataFrame, ra
 def with_matches(cands: pl.DataFrame, sub: pl.DataFrame) -> pl.DataFrame:
     """Candidate frame plus every matched id it lacks (appended), so matches stay a subset."""
     S1, M = postprocess.S1, postprocess.M
-    c, m = postprocess.pairs(cands), postprocess.pairs(sub)
-    extra = m.join(c, on=["s1", "m"], how="anti")
+    extra = postprocess.pairs(sub).join(postprocess.pairs(cands), on=["s1", "m"], how="anti")
     if not extra.height:
         return cands
-    e = extra.group_by("s1").agg(pl.col("m").sort().str.join(",").alias("x"))
-    return (cands.join(e.rename({"s1": S1}), on=S1, how="left", maintain_order="left")
-            .with_columns(pl.when(pl.col("x").is_null()).then(pl.col(M)).when(pl.col(M) == "").then(pl.col("x"))
-                          .otherwise(pl.col(M) + "," + pl.col("x")).alias(M)).drop("x"))
+    return postprocess.append_sorted(cands.rename({S1: "s1"}), M, extra, "m").rename({"s1": S1})
 
 
 def retrieve(bundle_dir: Path, records: pl.DataFrame, pairs: pl.DataFrame, text: pl.Series) -> pl.DataFrame:
@@ -89,7 +88,9 @@ def retrieve(bundle_dir: Path, records: pl.DataFrame, pairs: pl.DataFrame, text:
     for country in sorted(records["country_key"].unique().to_list()):
         rows = records.filter((pl.col("country_key") == country) & (pl.col("src") == 1))["row"]
         cand = pairs.select("i", "j").filter(pl.col("i").is_in(rows.implode()))
-        parts.append(recall.new_pairs(recall.neighbours(records, emb, country), cand, country))
+        nb = recall.neighbours(records, emb, country)
+        if nb:  # empty when the country lacks Source 1 or Source 2/3 records
+            parts.append(recall.new_pairs(nb, cand, country))
     del emb
     (bundle_dir / "test_scores" / "embeddings.npy").unlink()
     return recall.sort_pairs(pl.concat(parts))
@@ -98,20 +99,35 @@ def retrieve(bundle_dir: Path, records: pl.DataFrame, pairs: pl.DataFrame, text:
 def recall_pairs(bundle_dir: Path, records: pl.DataFrame, pairs: pl.DataFrame, text: pl.Series,
                  fixed: Path | None = None, inputs: dict | None = None) -> pl.DataFrame:
     """Recall new pairs with head probabilities, cached in test_scores/recall_pairs_<key>.parquet,
-    the key hashing the test files (`inputs`: name -> sha256), the recall model files and `fixed`
-    (a saved new-pair list to score instead of retrieving; see README, recall pairs)."""
+    the key hashing the test files (`inputs`: name -> sha256), the recall model files, the recall
+    settings, `fixed` (a saved new-pair list to score instead of retrieving; see README, recall
+    pairs) and, when retrieving, the sparse candidate pairs the new pairs must lie outside."""
     rdir = bundle_dir / RECALL_DIR
     files = [rdir / recall.HEAD_FILE, rdir / recall.ENCODER_DIR / "model.safetensors",
              fixed or rdir / recall.RETRIEVER_DIR / "model.safetensors"]
-    key = pipeline._dict_hash({"inputs": inputs or {}, "files": [pipeline._sha256(f) for f in files],
-                               "fixed": bool(fixed)})
-    cache = bundle_dir / "test_scores" / f"recall_pairs_{key}.parquet"
+    parts = {"inputs": inputs or {}, "files": [pipeline._sha256(f) for f in files], "fixed": bool(fixed),
+             "settings": [recall.K_FORWARD, recall.K_REVERSE, recall.FORWARD_NEW_RANK, recall.REVERSE_RANK,
+                          recall.REVERSE_CAP, RECALL_BATCH, RECALL_MAX_LENGTH]}
+    if not fixed:
+        h = hashlib.sha256()
+        for c in ("i", "j"):
+            h.update(pairs[c].to_numpy().tobytes())
+        parts["candidates"] = h.hexdigest()
+    cache = bundle_dir / "test_scores" / f"recall_pairs_{pipeline._dict_hash(parts)}.parquet"
     if cache.is_file():
         return pl.read_parquet(cache)
     t0 = time.time()
-    P = pl.read_parquet(fixed) if fixed else retrieve(bundle_dir, records, pairs, text)
+    if fixed:
+        P = pl.read_parquet(fixed)
+        missing = set(recall.NEW_PAIR_COLUMNS) - set(P.columns)
+        if missing:
+            raise data.DataError(f"{fixed}: recall pair list lacks columns {sorted(missing)}")
+        if P.height and max(P["s1_row"].max(), P["j_row"].max()) >= len(text):
+            raise data.DataError(f"{fixed}: record rows beyond this test split; the list belongs to other data")
+    else:
+        P = retrieve(bundle_dir, records, pairs, text)
     ce = pair_encoder.score(rdir / recall.ENCODER_DIR, text, P["s1_row"].to_numpy(), P["j_row"].to_numpy(),
-                            {"max_length": 128, "infer_batch": RECALL_BATCH, "device": "auto"})
+                            {"max_length": RECALL_MAX_LENGTH, "infer_batch": RECALL_BATCH, "device": "auto"})
     F = recall.head_features(P.with_columns(ce_logit=pl.Series(ce)), text)
     P = P.with_columns(prob=pl.Series(lgb.Booster(model_file=str(rdir / recall.HEAD_FILE)).predict(recall.head_matrix(F))))
     cache.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +170,11 @@ def predict(data_dir: Path, bundle_dir: Path, cache: Path | None = None, fixed_r
     c = cf.rename({postprocess.S1: "s1", postprocess.M: "id"})
     data.check_submission(ids, m, c, set(raw.filter(pl.col("src") != 1)["entity_id"].to_list()))
     report["final_matched_pairs"] = postprocess.pairs(sub).height
+    rdir = bundle_dir / RECALL_DIR
+    report["final"] = {"recall_pairs": {"file": fixed_recall.name, "sha256": pipeline._sha256(fixed_recall)}
+                       if fixed_recall else "retrieved", "derive_lists": derive_lists,
+                       "lists_sha256": pipeline._sha256(bundle_dir / LISTS_FILE),
+                       "head_sha256": pipeline._sha256(rdir / recall.HEAD_FILE)}
     return m, c, report
 
 
@@ -185,13 +206,16 @@ def train_recall_head(data_dir: Path, bundle_dir: Path, n_head: int = 200_000, s
     emb_path = bundle_dir / "recall_train_embeddings.npy"
     emb = recall.embed(rdir / recall.RETRIEVER_DIR, records, text, emb_path)
     cand = pairs.select("i", "j").filter(pl.col("i").is_in(head["row"].implode()))
-    parts = [recall.new_pairs(recall.neighbours(records, emb, c), cand, c).filter(pl.col("s1_row").is_in(head["row"].implode()))
-             for c in sorted(s1["country_key"].unique().to_list())]
+    parts = []
+    for c in sorted(s1["country_key"].unique().to_list()):
+        nb = recall.neighbours(records, emb, c)
+        if nb:  # empty when the country has no Source 2/3 records
+            parts.append(recall.new_pairs(nb, cand, c).filter(pl.col("s1_row").is_in(head["row"].implode())))
     del emb
     emb_path.unlink()
     P = recall.sort_pairs(pl.concat(parts))
     ce = pair_encoder.score(rdir / recall.ENCODER_DIR, text, P["s1_row"].to_numpy(), P["j_row"].to_numpy(),
-                            {"max_length": 128, "infer_batch": RECALL_BATCH, "device": "auto"})
+                            {"max_length": RECALL_MAX_LENGTH, "infer_batch": RECALL_BATCH, "device": "auto"})
     F = recall.head_features(P.with_columns(ce_logit=pl.Series(ce)), text)
     th = (truth.filter(pl.col("i").is_in(head["row"].implode()))
           .join(cand.with_columns(inc=pl.lit(True)), on=["i", "j"], how="left").with_columns(pl.col("inc").fill_null(False)))

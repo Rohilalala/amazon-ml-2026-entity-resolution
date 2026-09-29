@@ -398,8 +398,8 @@ test set. Every stage logs its duration and peak memory.
 .venv/bin/python -m pytest
 ```
 
-85 tests: 83 pass and 2 skip unless the challenge validator is at
-`student_resource/utils/validate_submission.py` next to `code/` (then all 85 run).
+90 tests: 88 pass and 2 skip unless the challenge validator is at
+`student_resource/utils/validate_submission.py` next to `code/` (then all 90 run).
 
 Covers normalisation (including transliteration and state names), the metric
 (the worked example in the problem statement, and the vectorised form against
@@ -418,7 +418,8 @@ and list semantics of steps C-H, each list rule on a small example, the recall p
 decision and kNN exactness, pseudo-label classes, quotas and determinism, and `final` end to end
 on the generated dataset (ACNRST stacker with two seed members, tiny encoders as retriever and
 recall encoder), which passes the validator and gives the same bytes with `--recall-pairs`, plus
-`encoder-train` (disjoint draws) and `recall-train`.
+`encoder-train` (disjoint draws), `recall-train`, and `check` (a matched id missing from its row's
+candidates fails; the written candidates hold every match, list adds included).
 
 ## Constraints respected
 

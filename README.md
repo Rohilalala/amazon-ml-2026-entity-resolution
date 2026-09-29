@@ -78,7 +78,7 @@ The code lives in [`code/business_entity_resolution`](code/business_entity_resol
 cd code/business_entity_resolution
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
-.venv/bin/python -m pytest          # 85 tests on generated data (CPU; the GPU is used when present)
+.venv/bin/python -m pytest          # 90 tests on generated data (CPU; the GPU is used when present)
 ```
 
 **Data.** The challenge data is not redistributed here. `DATA` below is the challenge `dataset/`

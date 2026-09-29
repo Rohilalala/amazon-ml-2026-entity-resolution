@@ -4,7 +4,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from src import adapt, postprocess as pp, recall, rules, stage4
+from src import adapt, final, postprocess as pp, recall, rules, stage4
 from src.features import prepare
 
 COMMON = ["club", "garage", "maison", "atelier", "cabinet", "boulangerie"]
@@ -64,6 +64,14 @@ def test_apply_lists_semantics():
     assert lists_of(out)["c"] == ["n"]
     late, rep = pp.apply_late(sub, drops, adds)
     assert lists_of(late) == {"a": ["x", "w"], "b": ["z"], "c": ["v"]} and rep == {"dropped": 1, "added": 2}
+
+
+def test_candidates_hold_every_match():
+    # list adds (India copies) can match ids no candidate list has; the written candidates must hold them
+    cands = sub_of({"a": ["x"], "b": [], "c": ["z"]})
+    sub = sub_of({"a": ["x", "w"], "b": ["v"], "c": []})
+    assert lists_of(final.with_matches(cands, sub)) == {"a": ["x", "w"], "b": ["v"], "c": ["z"]}
+    assert final.with_matches(cands, sub_of({"a": ["x"], "b": [], "c": []})).equals(cands)
 
 
 # ---------------------------------------------------------------- rules

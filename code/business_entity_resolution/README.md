@@ -213,8 +213,7 @@ cp new_pairs_leaderboard.parquet artifacts/final/recall/
 Run it:
 
 ```bash
-.venv/bin/python -m src.cli final --data DATA --model artifacts/final --out ../../output \
-    --recall-pairs artifacts/final/recall/new_pairs_leaderboard.parquet
+.venv/bin/python -m src.cli final --data DATA --model artifacts/final --out ../../output
 ```
 
 It writes `matching_results.tsv` and `candidate_pairs.tsv` (the stage-1-3 candidates, the recall new
@@ -228,10 +227,15 @@ including one the official validator leaves out, that every matched id is also a
 .venv/bin/python -m src.cli check --data DATA --out ../../output
 ```
 
-`--recall-pairs` scores a saved new-pair list instead of retrieving one. Without it, step B embeds
-every test record (written to `test_scores/embeddings.npy`, 9 GB, removed after the kNN) and builds
-the list with the code's deterministic tie-breaking, which differs from the leaderboard run's list in
-368 of 4,156,489 pairs (float16 cosine ties at the reverse-only cap).
+Step B embeds every test record (written to `test_scores/embeddings.npy`, 9 GB, removed after the
+kNN; 41 min with the kNN, 13.3 GB peak) and builds the list with the code's deterministic
+tie-breaking, which differs from the leaderboard run's list in 368 of 4,156,489 pairs (float16
+cosine ties at the reverse-only cap). On the leaderboard run's stage-4 scores, steps B-H with that
+list give the leaderboard `matching_results.tsv` byte for byte (none of the 368 pairs is added;
+the head probabilities of 278 other pairs of 62 records move by up to 0.035 and change no
+decision); `candidate_pairs.tsv` differs in the 368 ids. `--recall-pairs
+artifacts/final/recall/new_pairs_leaderboard.parquet` scores the saved list instead of retrieving
+one, which reproduces the candidate file byte for byte too.
 
 `lists.parquet` (columns step, action, rule, s1, m, src) holds the lists of steps E-H as the
 leaderboard run applied them:

@@ -290,7 +290,8 @@ def main(argv=None) -> int:
     p.add_argument("--out", type=Path, required=True, help="output folder for the TSVs")
     p.add_argument("--cache", type=Path, default=None, help="reuse prepared records and candidates across runs")
     p.add_argument("--recall-pairs", type=Path, default=None,
-                   help="score this saved recall new-pair list instead of retrieving (byte-exact leaderboard run)")
+                   help="score this saved recall new-pair list instead of retrieving (the leaderboard run's list "
+                        "reproduces its candidate file byte for byte)")
     p.add_argument("--derive-lists", action="store_true",
                    help="compute the lists of steps E-H with src/rules.py on the current decision instead of replaying them")
     p = sub.add_parser("check")

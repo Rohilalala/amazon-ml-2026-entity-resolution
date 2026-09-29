@@ -95,18 +95,20 @@ It holds:
 | `stage4_m{0,1,2}.txt` | stage-4 stacker, seed members 42, 7, 99 |
 | `recall/retriever/` | pretrained `intfloat/multilingual-e5-small` (MIT licence), unchanged |
 | `recall/encoder/`, `recall/head.txt`, `recall/head.json` | pair encoder and LightGBM head for the recall pairs |
-| `recall/new_pairs_leaderboard.parquet` | the recall new-pair list of the leaderboard run (see Reproducibility) |
+| `recall/new_pairs_leaderboard.parquet` | the recall new-pair list of the leaderboard run (optional, see Reproducibility) |
 | `lists.parquet` | pair lists of post-decision steps E-H (7,797 rows) |
 | `adapt/round3/pseudo.parquet`, `anchor.parquet` | the labels round 3 of test-time adaptation learned from (see Reproducibility) |
 
 **Predict** (the leaderboard run):
 
 ```bash
-.venv/bin/python -m src.cli final --data DATA --model artifacts/final --out ../../output \
-    --recall-pairs artifacts/final/recall/new_pairs_leaderboard.parquet
+.venv/bin/python -m src.cli final --data DATA --model artifacts/final --out ../../output
 ```
 
-Without `--recall-pairs`, step B retrieves its new pairs itself (embeddings, kNN, pair rule).
+Step B retrieves its new pairs itself (embeddings, kNN, pair rule). `--recall-pairs
+artifacts/final/recall/new_pairs_leaderboard.parquet` scores the leaderboard run's saved list
+instead, which skips the retrieval (about 40 minutes) and also reproduces `candidate_pairs.tsv`
+byte for byte (see Reproducibility).
 
 **Train.** Every model has a command; the code README lists them in order. In short:
 
@@ -133,7 +135,8 @@ Measured on the final run with the prepared-record cache:
 | recall encoder + head over 4.16M new pairs | 23 min | |
 | post-decision chain B-H | under 1 min | 8.2 GB |
 
-Retrieval without `--recall-pairs` embeds 11.7M records at about 8,700 records/s on the Apple GPU.
+Retrieval (skipped with `--recall-pairs`) embeds 11.7M records at about 7,000-8,800 records/s on the
+Apple GPU; with the kNN it took 41 min at 13.3 GB peak.
 
 ## Reproducibility
 
@@ -151,8 +154,11 @@ Retrieval without `--recall-pairs` embeds 11.7M records at about 8,700 records/s
   cosines tie often, and the leaderboard run ranked tied cosines in the row order of a join, which
   is not fixed (the same ranking without a tie-break gave different lists on two runs of this code).
   The code breaks ties by source and record, so its list is deterministic; it differs from the
-  leaderboard run's list in 368 of 4,156,489 pairs. `--recall-pairs` scores the leaderboard list
-  instead, for a byte-identical result.
+  leaderboard run's list in 368 of 4,156,489 pairs (367 records, each a swap between pairs of equal
+  cosine at the cap). None of them is added, so `matching_results.tsv` is still byte-identical
+  (measured: steps B-H on the leaderboard run's stage-4 scores with the list the code retrieved);
+  `candidate_pairs.tsv` differs in those 368 ids. `--recall-pairs` scores the leaderboard list
+  instead, for a byte-identical candidate file as well.
 - **Rule lists.** The leaderboard run derived each list of steps E-H on an earlier decision of the
   same run and applied the fixed list later, so the lists ship as data (`lists.parquet`).
   `src/rules.py` reproduces the France street, groupe tail-copy, cie/tailmid, sister2 and

@@ -20,7 +20,7 @@ lr 1e-5, one pass.
 import numpy as np
 import polars as pl
 
-from . import pair_encoder, postprocess
+from . import data, pair_encoder, postprocess
 
 POS_SHARE, POS_P4, HARD_P4, EASY_P4, HARD_PER_S1 = 0.55, 0.98, 0.05, 0.02, 2
 # The three rounds of the leaderboard run (init = the encoder the round starts from).
@@ -34,16 +34,18 @@ LR = 1e-5
 
 def classes(T: pl.DataFrame, kept: pl.DataFrame, negatives: pl.DataFrame | None) -> pl.DataFrame:
     """T: active pairs (i, j, country, p4, ce); kept / negatives: (i, j). Adds `cls`."""
-    T = T.join(kept.select("i", "j", kept=pl.lit(True)), on=["i", "j"], how="left").with_columns(pl.col("kept").fill_null(False))
+    # Left joins keep T's row order (maintain_order): sample() draws rows by position.
+    T = (T.join(kept.select("i", "j", kept=pl.lit(True)), on=["i", "j"], how="left", maintain_order="left")
+         .with_columns(pl.col("kept").fill_null(False)))
     if negatives is not None:
-        T = (T.join(negatives.select("i", "j", sister=pl.lit(True)), on=["i", "j"], how="left")
+        T = (T.join(negatives.select("i", "j", sister=pl.lit(True)), on=["i", "j"], how="left", maintain_order="left")
              .with_columns(pl.col("sister").fill_null(False)))
     else:
         T = T.with_columns(sister=pl.lit(False))
     hard = (T.filter(~pl.col("kept") & (pl.col("p4") <= HARD_P4))
             .with_columns(r=pl.col("ce").rank("ordinal", descending=True).over("i"))
             .filter(pl.col("r") <= HARD_PER_S1).select("i", "j", hard=pl.lit(True)))
-    return (T.join(hard, on=["i", "j"], how="left").with_columns(pl.col("hard").fill_null(False))
+    return (T.join(hard, on=["i", "j"], how="left", maintain_order="left").with_columns(pl.col("hard").fill_null(False))
             .with_columns(cls=pl.when(pl.col("sister")).then(pl.lit("sister"))
                           .when(pl.col("kept") & (pl.col("p4") >= POS_P4)).then(pl.lit("pos"))
                           .when(pl.col("hard")).then(pl.lit("hard")).when(pl.col("p4") <= EASY_P4).then(pl.lit("easy"))
@@ -55,6 +57,9 @@ def sample(T: pl.DataFrame, n_pseudo: int, france_share: float, rng: np.random.G
            with_negatives: bool) -> pl.DataFrame:
     """Pseudo-labelled sample (i, j, country, p4, ce, kept, cls, y, is_ho), sorted by (i, j)."""
     act = dict(T.group_by("country").len().iter_rows())
+    missing = {"us", "india", "france"} - set(act)
+    if missing:
+        raise data.DataError(f"pseudo-labels: no active test pairs of {sorted(missing)}")
     quota = {"france": france_share * n_pseudo}
     for c in ("us", "india"):
         quota[c] = (1 - france_share) * n_pseudo * act[c] / (act["us"] + act["india"])
@@ -64,7 +69,7 @@ def sample(T: pl.DataFrame, n_pseudo: int, france_share: float, rng: np.random.G
             d = T.filter((pl.col("country") == c) & (pl.col("cls") == k))
             n = int(round(q * f))
             if d.height < n:
-                raise ValueError(f"pseudo-labels: {c}/{k} has {d.height} pairs, needs {n}")
+                raise data.DataError(f"pseudo-labels: {c}/{k} has {d.height} pairs, needs {n}")
             S.append(d.gather(rng.choice(d.height, n, replace=False)))
     if with_negatives:
         S.append(T.filter(pl.col("cls") == "sister"))
@@ -87,7 +92,7 @@ def negatives_of(pre: list[pl.DataFrame], decision: pl.DataFrame, recs: postproc
     neg = pl.concat(pre).unique().join(decision, on=["s1", "m"], how="anti")
     if drop_scrambles:
         neg = neg.filter(~pl.Series([postprocess._scramble(recs, s, m) for s, m in neg.iter_rows()], dtype=pl.Boolean))
-    return neg.join(decision, on=["s1", "m"], how="anti")
+    return neg
 
 
 def anchors(fit: pl.DataFrame, n: int, rng: np.random.Generator) -> pl.DataFrame:
@@ -114,4 +119,4 @@ def train(init, out_dir, text_train: pl.Series, text_test: pl.Series, anchor: pl
     ho = pseudo.filter("is_ho").select(pl.col("i") + n, pl.col("j") + n, "y")
     ho = ho.gather(np.random.default_rng(1).permutation(ho.height)[:8192])
     return pair_encoder.train(init, out_dir, text, fit.with_columns(pl.col("y").cast(pl.Int8)),
-                              ho.with_columns(pl.col("y").cast(pl.Int8)), {**params, "lr": LR})
+                              ho.with_columns(pl.col("y").cast(pl.Int8)), {**params, "lr": LR, "one_stream": True})

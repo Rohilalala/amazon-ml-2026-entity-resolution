@@ -119,6 +119,7 @@ class Config:
         return cls(**d)
 
     def lgb(self, stage: int = 1):
-        """LightGBM parameters for a stage, with the run seed applied."""
-        extra = self.stage3_lgb_params if stage == 3 else {}
+        """LightGBM parameters for a stage, with the run seed applied. The stage-4 stacker runs on 8
+        threads, as the shipped stacker was trained (thread count can change LightGBM's sums)."""
+        extra = self.stage3_lgb_params if stage == 3 else {"num_threads": 8} if stage == 4 else {}
         return {**self.lgb_params, **extra, "seed": self.seed}

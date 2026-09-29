@@ -95,7 +95,9 @@ def _stage4_import(args) -> None:
         raise data.DataError(f"no model bundle at {args.model}")
     meta = json.loads(args.stacker_meta.read_text())
     names = meta.get("features")
-    stage4.feature_set(names or [])  # a known feature set
+    if "rule" not in meta:
+        raise data.DataError(f"{args.stacker_meta}: no decision rule ('rule')")
+    fset = stage4.feature_set(names or [])  # a known feature set
     for f in args.stacker:
         if lgb.Booster(model_file=str(f)).num_feature() != len(names):
             raise data.DataError(f"{f}: stacker features are not the {len(names)} of {args.stacker_meta}")
@@ -106,10 +108,12 @@ def _stage4_import(args) -> None:
     files = pipeline.stage4_files(len(args.stacker))
     for f, name in zip(args.stacker, files):
         shutil.copyfile(f, args.model / name)
+    seeds = meta.get("seeds")
+    config = {"stage4_features": fset, **({"stage4_seeds": seeds} if seeds and len(seeds) == len(args.stacker) else {})}
     pipeline.set_stage4_meta(args.model, meta["rule"], {
         "imported": {"encoder": args.encoder.name, "stacker": [f.name for f in args.stacker], "rounds": meta.get("rounds"),
-                     "seeds": meta.get("seeds"), "encoder_sha256": pipeline._sha256(args.encoder / "model.safetensors"),
-                     "stacker_sha256": [pipeline._sha256(f) for f in args.stacker]}}, names, files)
+                     "seeds": seeds, "encoder_sha256": pipeline._sha256(args.encoder / "model.safetensors"),
+                     "stacker_sha256": [pipeline._sha256(f) for f in args.stacker]}}, names, files, **config)
     bundle = pipeline.Bundle.load(args.model)
     log.info("stage 4 imported into %s: %d member(s), %d features, rule %s", args.model, len(bundle.stage4.boosters),
              len(names), bundle.stage4_rule)
@@ -123,16 +127,20 @@ def _post_import(args) -> None:
     meta = json.loads(args.head_meta.read_text())
     if meta.get("features") != recall.HEAD_FEATURES:
         raise data.DataError(f"{args.head_meta}: head features are not {recall.HEAD_FEATURES}")
-    for name, src in ((recall.RETRIEVER_DIR, args.retriever), (recall.ENCODER_DIR, args.recall_encoder)):
+    if lgb.Booster(model_file=str(args.head)).num_feature() != len(recall.HEAD_FEATURES):
+        raise data.DataError(f"{args.head}: the head does not read the {len(recall.HEAD_FEATURES)} head features")
+    lists = pl.read_parquet(args.lists)
+    if lists.columns != ["step", "action", "rule", "s1", "m", "src"]:
+        raise data.DataError(f"{args.lists}: columns must be step, action, rule, s1, m, src")
+    for src in (args.retriever, args.recall_encoder):
         if not (src / "model.safetensors").is_file():
             raise data.DataError(f"no model.safetensors in {src}")
+    # every input checked: nothing is copied from a bad import
+    for name, src in ((recall.RETRIEVER_DIR, args.retriever), (recall.ENCODER_DIR, args.recall_encoder)):
         shutil.copytree(src, rdir / name, dirs_exist_ok=True)
         os.chmod(rdir / name / "model.safetensors", 0o644)
     shutil.copyfile(args.head, rdir / recall.HEAD_FILE)
     (rdir / recall.HEAD_META).write_text(json.dumps(meta, indent=1))
-    lists = pl.read_parquet(args.lists)
-    if lists.columns != ["step", "action", "rule", "s1", "m", "src"]:
-        raise data.DataError(f"{args.lists}: columns must be step, action, rule, s1, m, src")
     shutil.copyfile(args.lists, args.model / final.LISTS_FILE)
     log.info("post-decision pieces imported into %s: head t_keep %s t_none %s, %d list rows", args.model,
              meta["t_keep"], meta["t_none"], lists.height)
@@ -165,10 +173,11 @@ def _adapt_labels(args) -> None:
     decision = read(args.decision)
     neg = None
     if args.negatives_from:
+        # BEFORE[:AFTER], split at the last colon unless the whole value is a file (a path with a colon)
         pre = [read(a).join(read(b), on=["s1", "m"], how="anti") if b else read(a)
-               for a, _, b in (x.partition(":") for x in args.negatives_from)]
-        neg = adapt.to_rows(adapt.negatives_of([pl.DataFrame({"s1": q["s1"], "m": q["m"]}) for q in pre], decision,
-                                               recs, args.drop_scrambles), ids)
+               for a, b in ((x, "") if ":" not in x or Path(x).is_file() else x.rpartition(":")[::2]
+                           for x in args.negatives_from)]
+        neg = adapt.to_rows(adapt.negatives_of(pre, decision, recs, args.drop_scrambles), ids)
     fit = pl.read_parquet(args.anchor_pool)
     S, A = adapt.build(T, adapt.to_rows(decision, ids), neg, fit, adapt.ROUNDS[args.round])
     args.out.mkdir(parents=True, exist_ok=True)
@@ -290,8 +299,8 @@ def main(argv=None) -> int:
     p.add_argument("--out", type=Path, required=True, help="output folder for the TSVs")
     p.add_argument("--cache", type=Path, default=None, help="reuse prepared records and candidates across runs")
     p.add_argument("--recall-pairs", type=Path, default=None,
-                   help="score this saved recall new-pair list instead of retrieving (the leaderboard run's list "
-                        "reproduces its candidate file byte for byte)")
+                   help="score this saved recall new-pair list instead of retrieving (recall/new_pairs_leaderboard.parquet: "
+                        "the leaderboard run's list)")
     p.add_argument("--derive-lists", action="store_true",
                    help="compute the lists of steps E-H with src/rules.py on the current decision instead of replaying them")
     p = sub.add_parser("check")

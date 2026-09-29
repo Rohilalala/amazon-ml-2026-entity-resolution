@@ -165,6 +165,13 @@ def train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: pl
     return report
 
 
+def _streams(seed: int, one_stream: bool) -> tuple:
+    """(pair-order, batch-order) generators. The lab's v1-v3 encoder runs drew both orders from
+    two generators seeded alike; the adaptation rounds drew them from one stream in turn."""
+    rng = np.random.default_rng(seed)
+    return rng, rng if one_stream else np.random.default_rng(seed)
+
+
 def _train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: pl.DataFrame, params: dict):
     """Child-process body of train: returns (report, validation logits)."""
     import torch
@@ -176,7 +183,7 @@ def _train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: p
     model.get_input_embeddings().weight.requires_grad_(False)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=params["lr"],
                             weight_decay=params["weight_decay"])
-    rng = np.random.default_rng(params["seed"])  # one stream: pair order, then batch order
+    rng, batch_rng = _streams(params["seed"], params.get("one_stream", False))
     fit = fit.gather(rng.permutation(fit.height))
     ids = []
     for s in range(0, fit.height, CHUNK):
@@ -189,7 +196,7 @@ def _train(base: Path, out_dir: Path, text: pl.Series, fit: pl.DataFrame, val: p
         c = np.arange(s, min(s + bs * 64, len(ids)))
         c = c[np.argsort(lens[c], kind="stable")]
         batches += [c[k:k + bs] for k in range(0, len(c), bs)]
-    batches = [batches[k] for k in rng.permutation(len(batches))]
+    batches = [batches[k] for k in batch_rng.permutation(len(batches))]
     log.info("pair encoder training on %s: %d pairs (%d positives), %d steps", dev, len(ids), int(y.sum()), len(batches))
     model.train()
     t0, warm = time.time(), params["warmup"]

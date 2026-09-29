@@ -823,7 +823,7 @@ def train_stage4(data_dir: Path, bundle_dir: Path, base: Path | None, cache: Pat
     folds = fold_ids(A["entity"].to_numpy(), cfg4)
     oofs, fold_rounds = [], []
     for sd in cfg.stage4_seeds:
-        o, boosters = cross_validate(x, y, folds, replace(cfg4, seed=sd))
+        o, boosters = cross_validate(x, y, folds, replace(cfg4, seed=sd), stage=4)
         oofs.append(o)
         fold_rounds.append([b.best_iteration for b in boosters])
     p4 = prob.astype(np.float64)
@@ -831,7 +831,7 @@ def train_stage4(data_dir: Path, bundle_dir: Path, base: Path | None, cache: Pat
     n_true, y_all = sample["n_true"].to_numpy(), oof["y"].to_numpy()
     f4, rule, trials = choose_rule(codes, n_true, p4, y_all)
     rounds = [max(1, int(np.mean(r))) for r in fold_rounds]
-    members = [fit(x, y, replace(cfg, seed=sd), rounds=n) for sd, n in zip(cfg.stage4_seeds, rounds)]
+    members = [fit(x, y, replace(cfg, seed=sd), rounds=n, stage=4) for sd, n in zip(cfg.stage4_seeds, rounds)]
     bundle.stage4, bundle.stage4_rule = Stage(names, members), rule
     report = {"encoder": enc_report, "features": cfg.stage4_features, "seeds": cfg.stage4_seeds,
               "active_pairs": int(act.sum()), "fold_rounds": fold_rounds, "final_rounds": rounds,
@@ -878,6 +878,8 @@ def train_encoder(data_dir: Path, bundle_dir: Path, init: Path, out_dir: Path, l
     exclude_j = oof.filter(pl.Series(prob >= cfg.stage4_active))["j"].unique()
     used = pl.concat([sample["row"], holdout["row"], *[pl.read_parquet(Path(f) / "s1_draw.parquet")["i"] for f in exclude]])
     pool = n_true_all.filter(~pl.col("row").is_in(used.implode())).sort("row")
+    if draw > pool.height:
+        raise data.DataError(f"--draw {draw}: only {pool.height} fresh training Source 1 records are left")
     fresh = (pool.sample(draw, seed=seed) if draw else pool).sort("row")
     val = fresh.sample(min(10_000, fresh.height // 10), seed=seed + 1)["row"]
     P = (pairs.select("i", "j", "score").filter(pl.col("i").is_in(fresh["row"].implode()))
@@ -898,11 +900,12 @@ def train_encoder(data_dir: Path, bundle_dir: Path, init: Path, out_dir: Path, l
 
 
 def set_stage4_meta(bundle_dir: Path, rule: dict, report: dict, features: list = stage4.FEATURES,
-                    models: list = (STAGE4_FILE,)) -> None:
-    """Record stage 4 (stacker files, features, rule, how it was made) in a saved bundle.json."""
+                    models: list = (STAGE4_FILE,), **config) -> None:
+    """Record stage 4 (stacker files, features, rule, how it was made) in a saved bundle.json;
+    `config`: settings to change with it (e.g. stage4_features of an imported stacker)."""
     path = bundle_dir / BUNDLE_FILE
     meta = json.loads(path.read_text())
-    meta["config"] = Config.from_dict(meta["config"]).to_dict()  # writes the stage-4 settings in use
+    meta["config"] = Config.from_dict({**meta["config"], **config}).to_dict()  # writes the stage-4 settings in use
     meta["stage4"] = {"features": list(features), "models": list(models), "rule": rule}
     meta["report"]["stage4"] = report
     path.write_text(json.dumps(meta, indent=2))
@@ -915,7 +918,7 @@ def predict(data_dir: Path, bundle: Bundle, cache: Path | None = None, bundle_di
     if bundle.config.stage4_scope != "none" and (bundle.stage4 is None or bundle_dir is None
                                                  or not (bundle_dir / pair_encoder.ENCODER_DIR).is_dir()):
         raise data.DataError(f"stage4_scope={bundle.config.stage4_scope!r} needs a bundle with stage 4 (encoder/ "
-                             f"and {STAGE4_FILE}); see `stage4-import` / `stage4-train`")
+                             f"and the stage-4 stacker file(s)); see `stage4-import` / `stage4-train`")
     raw = data.load_split(data_dir, "test")
     prov = provenance(data_dir, "test")
     native = bundle.native_words or {}

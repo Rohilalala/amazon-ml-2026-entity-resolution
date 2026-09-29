@@ -12,7 +12,7 @@ three-stage LightGBM matcher, a fine-tuned multilingual pair encoder with a Ligh
 recall with a pretrained text embedding, test-time adaptation of the encoder, and label-free
 post-decision rules for the country absent from training. The shipped model files reproduce the
 uploaded leaderboard file byte for byte; [Reproducibility](#reproducibility) says which runs measured
-this and which command has not yet been run end to end.
+this.
 
 ## Results
 
@@ -144,7 +144,15 @@ the tested minimum. LightGBM and polars run on the CPU; the encoders run on the 
 PyTorch MPS (CUDA or CPU otherwise, much slower on CPU). The pipeline logs peak memory in GiB
 (2^30 bytes); `/usr/bin/time` figures below are in GB (10^9 bytes).
 
-The one full `final` run (28 Sep, with `--cache` from an earlier run, so without normalisation and
+The default command in a clean checkout (30 Sep, with retrieval; normalisation and blocking came from
+the same checkout's cache, written by a first attempt that was stopped later during recall scoring)
+took 9,674 s (2 h 41 min); maximum resident set 12.6 GB, macOS peak memory footprint 23.0 GB. Its
+steps: stages 1-3 42 min (8.9 GiB peak), pair encoder 46 min, stacker 1.8 min, retrieval 30 min,
+recall in all (retrieval, kNN, scoring of 4.16M new pairs) 69 min, post-decision chain 27 s. The
+first attempt's normalisation and blocking took 97 s and 43 min (47.2M pairs, 8.5 GiB peak), so a
+run from an empty cache comes to about 3.4 hours (the sum of the two runs; not timed as one process).
+
+The earlier `final` run (28 Sep, with `--cache` from an earlier run, so without normalisation and
 blocking, and with `--recall-pairs`, so without retrieval) took 6,329 s (1 h 45 min); maximum
 resident set 11.8 GB, macOS peak memory footprint 23.1 GB. Its steps:
 
@@ -158,25 +166,23 @@ resident set 11.8 GB, macOS peak memory footprint 23.1 GB. Its steps:
 
 Not in that run, measured separately:
 
-- Retrieval, which the default command runs: 11.7M records embedded at 7,225 records/s on average,
-  41 min with the kNN (2,453 s), peak 13.3 GiB (14.2 GB resident). This was the retrieval code run
-  from a script, not through `final`; the peak of a whole default run has not been measured.
-- Normalisation and blocking (a first run, or a run without `--cache`): not measured on the final
-  code; about 50 minutes per split on an earlier version ([docs/METHODOLOGY.md](docs/METHODOLOGY.md)).
+- Retrieval run on its own from a script: 11.7M records embedded at 7,225 records/s on average,
+  41 min with the kNN (2,453 s), peak 13.3 GiB (14.2 GB resident).
 
 Disk: the bundle 1.6 GB; `test_scores/`, written into the bundle by every run, about 1.5 GB;
 `embeddings.npy` 9 GB during retrieval (deleted after the kNN); the test candidate cache 1.4 GB.
 
 ## Reproducibility
 
-- **Byte-identical output: what was measured.** One `final` run end to end, with `--cache` and
+- **Byte-identical output: what was measured.** The default command above (with retrieval, no
+  `--recall-pairs`), run in a clean checkout of this code with the bundle as distributed, wrote the
+  uploaded leaderboard file (sha256 `0a76fb8fa921d23d8c3ec208849d740e5d1a531c573185229b1c7156b88c978c`)
+  and `candidate_pairs.tsv` sha256 `95366357…`; the official validator passes (also with
+  `--check-ids`), and `check` confirms every matched id is a candidate of its row. Its
+  normalisation and blocking came from the same checkout's cache (see "Hardware and timings").
+  Before that, one `final` run with `--cache` and
   `--recall-pairs artifacts/final/recall/new_pairs_leaderboard.parquet`, on the code as of 28 Sep
-  00:58 (before commit 53ad459; later commits changed the code), wrote the uploaded leaderboard
-  file (sha256 `0a76fb8fa921d23d8c3ec208849d740e5d1a531c573185229b1c7156b88c978c`) and passed the
-  official validator. The default command above, with retrieval, has not yet been run end to end in
-  one piece: its retrieval was run on its own, and steps B-H on the leaderboard run's saved stage-4
-  scores with the retrieved list give the same sha256 (see "Recall pair list"; rechecked on the
-  current code). Each stage was also checked against the files of the leaderboard run: stacker
+  00:58 (before commit 72e8b92), wrote the same leaderboard file. Each stage was also checked against the files of the leaderboard run: stacker
   probabilities of all 8.08M active pairs, recall head probabilities, every step of the
   post-decision chain, the round-3 pseudo-labels, the retriever embeddings of a 200,000-record
   chunk, one kNN list (France Source 3), and eight of the list rules on the decisions they were

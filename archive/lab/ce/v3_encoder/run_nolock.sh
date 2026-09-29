@@ -1,5 +1,5 @@
 #!/bin/sh
-# Resume v3 training from out/ckpt WITHOUT the global heavy lock (the recall workflow owns it), lower MPS cap,
+# Resume v3 training from out/ckpt WITHOUT the global heavy lock (another job holds it), lower MPS cap,
 # then the same scoring steps as run_all.sh. Re-running resumes each step.
 cd "$(dirname "$0")"
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.7 PYTORCH_MPS_LOW_WATERMARK_RATIO=0.6 TOKENIZERS_PARALLELISM=true HF_HUB_OFFLINE=1

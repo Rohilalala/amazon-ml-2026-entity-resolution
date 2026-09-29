@@ -1,8 +1,13 @@
-# ML Challenge 2026: Business Entity Resolution Solution Template
+# Business Entity Resolution: Method up to Stage 4 (Amazon ML Challenge 2026)
 
 **Team Name:** MEOW MEOW  
-**Team Members:** Aditya Rohilla, [second team member]  
-**Submission Date:** 25 September 2026
+**Team Members:** Aditya Rohilla, Priyanshu Ghosh  
+**Written:** 25 September 2026, for the v9 bundle
+
+This write-up covers the pipeline up to stage 4 (the v9 bundle, an earlier submission). The
+final submission (0.989667) adds dense recall, test-time adaptation of the encoder and the
+post-decision rules of steps B-H; those are described in the repository README and the code
+README. Where this document says "submitted", it means the v9 submission.
 
 ---
 
@@ -337,7 +342,7 @@ letters ("pi1ates"→"pilates").
   probabilities, the pinned calibration, the unseen-country rules). Under
   `all`, France gets the stage-4 probabilities, then the same calibration (its
   "keep nothing" weight reaches the 4× cap) and the same unseen-country rules.
-  **The submitted bundle uses `stage4_scope = seen`.**
+  **The v9 bundle uses `stage4_scope = seen`; the final bundle uses `all`.**
 
 ---
 
@@ -399,7 +404,7 @@ country.
 
 | Path | Role |
 |---|---|
-| `src/cli.py` | Entry point: `run` (train + predict), `train`, `predict`, `block` (blocking recall only), `decide` (re-apply the decision rule to saved scores), `vocab` (add training-pool token tables to a bundle), `configure` (change a saved setting), `stage4-train` (fine-tune the encoder and train the stacker into a bundle), `stage4-import` (add an already trained encoder and stacker to a bundle) |
+| `src/cli.py` | Entry point: `run` (train + predict), `train`, `predict`, `block` (blocking recall only), `decide` (re-apply the decision rule to saved scores), `vocab` (add training-pool token tables to a bundle), `configure` (change a saved setting), `stage4-train` (fine-tune the encoder and train the stacker into a bundle), `stage4-import` (add an already trained encoder and stacker to a bundle); the commands of the final run (`final`, `check`, `post-import`, `encoder-train`, `recall-train`, `adapt-labels`, `adapt-train`) are in the code README |
 | `src/data.py` | TSV loading with schema checks; submission-rule checks; atomic writes |
 | `src/text.py` | Normalisation, transliteration, state codes, skeletons |
 | `src/indic.py` | Indic-to-English word dictionary learned from training pairs |
@@ -413,7 +418,7 @@ country.
 | `src/stage4.py` | Stage-4 features, stacker scoring, scope routing, encoder training-pair selection |
 | `src/metric.py` | Macro F0.5, reference and vectorised forms |
 | `src/config.py` | All settings; saved inside the model bundle |
-| `tests/` | 69 tests, including synthetic end-to-end runs (stage 4 with a tiny encoder on the CPU) checked with the challenge validator |
+| `tests/` | synthetic end-to-end runs (stage 4 with a tiny encoder on the CPU) checked with the challenge validator; the code README gives the current count |
 
 To reproduce both output files:
 
@@ -431,7 +436,7 @@ elsewhere): fine-tuning about 72 minutes, test encoding about 40 minutes.
 Peak memory is under 21 GB. Pass `--cache DIR` to reuse the candidate tables
 between runs. No network is used at run time.
 
-The submitted files come from the v9 bundle: the v8 bundle (the v7 bundle plus
+The v9 submission came from the v9 bundle: the v8 bundle (the v7 bundle plus
 the training-pool token tables and the corrected settings) plus stage 4. With
 the v7 bundle in `artifacts/v7`:
 
@@ -452,9 +457,9 @@ mkdir artifacts/v9 && cp artifacts/v8/*.* artifacts/v9/
 `stage4-train --data <dataset dir> --model artifacts/v9 --base <base checkpoint>`
 retrains stage 4 instead of importing it; the base checkpoint is downloaded
 once beforehand (`hf download intfloat/multilingual-e5-small --revision
-614241f622f53c4eeff9890bdc4f31cfecc418b3`). The zip carries `artifacts/v9`
-ready made, fine-tuned weights included (see the code README), so only the
-last command is needed.
+614241f622f53c4eeff9890bdc4f31cfecc418b3`). The v9 bundle is not distributed;
+the final bundle (`artifacts/final`, see the repository README) is, and its
+leaderboard run is `final`.
 
 ### B. Additional Results
 

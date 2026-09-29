@@ -13,9 +13,16 @@ weights and outputs are not included.
 | `lab/recall/` | Dense retrieval (embeddings, kNN) and the recall head for pairs the blocker missed | `src/recall.py`, `recall-train` |
 | `lab/hunt/fr_sister/`, `lab/hunt/restore_scrambles.py` | France sister-organisation filter and scramble restore | `src/postprocess.py` |
 | `lab/adapt/` | Test-time adaptation of the encoder, rounds 1-3 | `src/adapt.py`, `adapt-labels`, `adapt-train` |
-| `lab/hunt/deep/`, `sweep/`, `extras/`, `late/` | France / India / US list rules (tail copies, street decoys, cie expansions, pool copies, source caps) | `src/rules.py`, `lists.parquet` |
+| `lab/hunt/deep/`, `lab/hunt/sweep/`, `lab/hunt/extras/`, `lab/hunt/late/` | France / India / US list rules (tail copies, street decoys, cie expansions, pool copies, source caps) | `src/rules.py`, `lists.parquet` |
+| `lab/hunt/fr_exact/` | France exact-copy adds (same core name and house number) | not among the final lists |
+| `lab/hunt/sparse/` | Wider sparse blocking (more candidates, higher max_df) on the holdout, next to dense recall | not in the pipeline; the final run uses dense recall (`src/recall.py`) |
 | `lab/hunt/plan/s4ce/` | Stage-4 stacker variants, test decision and build | `src/stage4.py` (ACNRST set) |
-| `lab/day1b/`, `lab/audit_a/` | Heavy-job lock, file mixer, per-country rescoring helpers | |
+| `lab/day1b/`, `lab/audit_a/` | Heavy-job lock, file mixer, per-country rescoring helpers | (tooling only, not in the pipeline) |
+
+The `judge/` folders under `lab/hunt/` hold read-only checks that print records for inspection and
+scripts that merge and apply rule lists. Every accepted list came from a rule; the rules with code
+are in `src/rules.py` (step H's region-conflict drops among them), and `lists.parquet` holds the
+lists as applied.
 
 Leaderboard effect of each line of work, as logged at the time:
 

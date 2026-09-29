@@ -33,7 +33,7 @@ FOLDS, SEED = 5, CFG["seed"]
 FEAT_A = ["lp", "ce", "b_empty", "ce_rank", "ce_gap", "lp_rank", "lp_gap", "n_i"]
 FEAT_B = FEAT_A + ["n_j", "j_ce_other"]
 T0 = time.time()
-PARAMS["num_threads"] = 8  # share the CPU with the other workflow's jobs
+PARAMS["num_threads"] = 8  # share the CPU with other jobs
 
 
 def _rss_guard(limit=6e9):

@@ -66,6 +66,15 @@ def test_apply_lists_semantics():
     assert lists_of(late) == {"a": ["x", "w"], "b": ["z"], "c": ["v"]} and rep == {"dropped": 1, "added": 2}
 
 
+def test_a_dropped_candidate_readded_elsewhere_per_step():
+    # drop (a, x) and add (b, x) in one step: E/G look after the drops, F (sources) and H before them
+    sub, drop, add = sub_of({"a": ["x"], "b": []}), pl.DataFrame({"s1": ["a"], "m": ["x"]}), pl.DataFrame({"s1": ["b"], "m": ["x"]})
+    assert lists_of(pp.apply_lists(sub, drop, add)[0]) == {"a": [], "b": ["x"]}
+    src = pl.DataFrame({"s1": ["zz"], "m": ["q"], "src": [["q"]]})
+    assert lists_of(pp.apply_lists(sub, drop, add, sources=src)[0]) == {"a": [], "b": []}
+    assert lists_of(pp.apply_late(sub, drop, add)[0]) == {"a": [], "b": []}
+
+
 def test_candidates_hold_every_match():
     # list adds (India copies) can match ids no candidate list has; the written candidates must hold them
     cands = sub_of({"a": ["x"], "b": [], "c": ["z"]})
@@ -169,12 +178,49 @@ def test_recall_apply_appends_sorted_adds_and_candidates():
 
 
 def test_knn_is_exact():
+    # 5000 targets = 40 column groups, k = 20: the group pruning has to choose
     rng = np.random.default_rng(0)
-    q, t = (rng.normal(size=(n, 384)) for n in (50, 300))
+    q, t = (rng.normal(size=(n, 384)) for n in (50, 5000))
     q, t = ((x / np.linalg.norm(x, axis=1, keepdims=True)).astype(np.float16) for x in (q, t))
-    idx, cos = recall.knn(q, t, 5)
-    ref = np.argsort(-(q.astype(np.float32) @ t.astype(np.float32).T), axis=1)[:, :5]
-    assert (idx[:, 0] == ref[:, 0]).mean() > 0.95 and (np.diff(cos.astype(np.float32), axis=1) <= 0).all()
+    idx, cos = recall.knn(q, t, 20)
+    s = q.astype(np.float32) @ t.astype(np.float32).T
+    ref = -np.sort(-s, axis=1)[:, :20]
+    got = -np.sort(-np.take_along_axis(s, idx, axis=1), axis=1)
+    assert np.abs(got - ref).max() < 2e-3  # the true top 20 up to float16 rounding
+    assert (np.diff(cos.astype(np.float32), axis=1) <= 0).all()
+
+
+def test_derive_routes_each_rule_to_its_step(monkeypatch):
+    def pairs_(tag):
+        return pl.DataFrame({"s1": [tag], "m": [tag]})
+    for name in ("street_drops", "groupe_swap_adds", "cie_tailmid_adds", "sister2_drops", "us_state_conflict_drops",
+                 "region_conflict_drops"):
+        monkeypatch.setattr(rules, name, lambda *a, _n=name: pairs_(_n))
+    monkeypatch.setattr(rules, "india_copy_adds", lambda *a: pl.DataFrame({"s1": ["copy"], "m": ["copy"], "src": [["x"]]}))
+    shipped = {(st, act): pl.DataFrame({"s1": [f"{st}{act}{r}" for r in rs], "m": ["m"] * len(rs), "rule": rs})
+               for st, act, rs in (("G", "drop", ["sister2", "stateconf", "srccap"]), ("G", "add", ["groupe_nolegal"]),
+                                   ("H", "drop", ["fr_region_conflict", "neartie"]), ("H", "add", []))}
+    col = lambda f: f["s1"].to_list()
+    d, a, src = rules.derive("E", None, None, None, None, None, None, shipped)
+    assert (col(d), col(a), src) == (["street_drops"], ["groupe_swap_adds"], None)
+    d, a, src = rules.derive("F", None, None, None, None, None, None, shipped)
+    assert (d.height, col(a), col(src)) == (0, ["cie_tailmid_adds", "copy"], ["copy"])
+    d, a, _ = rules.derive("G", None, None, None, None, None, None, shipped)
+    assert (col(d), col(a)) == (["sister2_drops", "us_state_conflict_drops", "Gdropsrccap"], ["Gaddgroupe_nolegal"])
+    d, a, _ = rules.derive("H", None, None, None, None, None, None, shipped)
+    assert (col(d), a.height) == (["region_conflict_drops", "Hdropneartie"], 0)
+
+
+def test_training_shuffle_streams():
+    from src import pair_encoder
+    a, b = pair_encoder._streams(5, False)  # v1-v3 encoders: two generators seeded alike
+    a.permutation(10)
+    assert b.permutation(4).tolist() == np.random.default_rng(5).permutation(4).tolist()
+    a, b = pair_encoder._streams(5, True)  # adaptation: one stream, pairs then batches
+    ref = np.random.default_rng(5)
+    ref.permutation(10)
+    a.permutation(10)
+    assert b is a and b.permutation(4).tolist() == ref.permutation(4).tolist()
 
 
 # ---------------------------------------------------------------- adaptation

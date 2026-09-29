@@ -385,6 +385,30 @@ def test_stage4_import_copies_encoder_and_stacker(stage4_model, trained, tmp_pat
     assert str(src) not in (copy / pipeline.BUNDLE_FILE).read_text()  # file names only, no local paths
     meta.write_text(json.dumps({"features": stage4.FEATURES[:-1], "rule": rule}))
     assert cli.main(args) == 2
+    meta.write_text(json.dumps({"features": stage4.FEATURES}))
+    assert cli.main(args) == 2  # no rule
+
+
+def test_stage4_import_of_seed_members_sets_the_config(stage4_model, trained, tmp_path):
+    import lightgbm as lgb
+    src, _ = stage4_model
+    model_dir, _ = trained
+    copy = tmp_path / "model"
+    shutil.copytree(model_dir, copy)
+    names = stage4.FEATURE_SETS["ACNRST"]
+    x = np.random.default_rng(0).random((300, len(names)))
+    files = []
+    for k in range(2):
+        files.append(tmp_path / f"member{k}.txt")
+        lgb.train({"objective": "binary", "verbose": -1, "seed": k}, lgb.Dataset(x, (x[:, k] > 0.5).astype(int)), 3) \
+            .save_model(files[-1])
+    meta = tmp_path / "stage4.json"
+    meta.write_text(json.dumps({"features": names, "rule": pipeline.Bundle.load(src).stage4_rule, "seeds": [42, 7]}))
+    assert cli.main(["stage4-import", "--model", str(copy), "--encoder", str(src / pair_encoder.ENCODER_DIR),
+                     "--stacker", str(files[0]), "--stacker", str(files[1]), "--stacker-meta", str(meta)]) == 0
+    bundle = pipeline.Bundle.load(copy)
+    assert len(bundle.stage4.boosters) == 2 and all((copy / f"stage4_m{k}.txt").is_file() for k in range(2))
+    assert (bundle.config.stage4_features, bundle.config.stage4_seeds) == ("ACNRST", [42, 7])
 
 
 @pytest.fixture(scope="module")
@@ -426,15 +450,20 @@ def test_final_stage4_members_and_outputs(dataset, final_model):
     report = json.loads((model_dir / "predict_report.json").read_text())
     assert set(report["post"]) == {"B_recall", "C_sister", "D_restore", "E_lists", "F_lists", "G_lists", "H_lists"}
     assert report["post"]["B_recall"]["new_pairs"] > 0
-    if VALIDATOR.is_file():
-        res = subprocess.run([sys.executable, str(VALIDATOR), "--matching", str(out / "a" / "matching_results.tsv"),
-                              "--candidate", str(out / "a" / "candidate_pairs.tsv"), "--test-dir", str(dataset / "test"),
-                              "--check-ids"], capture_output=True, text=True)
-        assert res.returncode == 0, res.stdout + res.stderr
+    assert report["final"]["recall_pairs"] == "retrieved" and report["final"]["derive_lists"] is False
+
+
+@pytest.mark.skipif(not VALIDATOR.is_file(), reason="challenge validator not present")
+def test_final_output_passes_the_official_validator(dataset, final_model):
+    _, out, _ = final_model
+    res = subprocess.run([sys.executable, str(VALIDATOR), "--matching", str(out / "a" / "matching_results.tsv"),
+                          "--candidate", str(out / "a" / "candidate_pairs.tsv"), "--test-dir", str(dataset / "test"),
+                          "--check-ids"], capture_output=True, text=True)
+    assert res.returncode == 0, res.stdout + res.stderr
 
 
 def test_final_with_a_saved_recall_list_matches(dataset, final_model):
-    model_dir, out, final = final_model
+    model_dir, out, _ = final_model
     (cached,) = (model_dir / "test_scores").glob("recall_pairs_*.parquet")
     fixed = out / "recall_pairs.parquet"
     pl.read_parquet(cached).drop("prob").write_parquet(fixed)
@@ -443,6 +472,10 @@ def test_final_with_a_saved_recall_list_matches(dataset, final_model):
                      "--recall-pairs", str(fixed)]) == 0
     for f in ("matching_results.tsv", "candidate_pairs.tsv"):
         assert (out / "a" / f).read_bytes() == (out / "b" / f).read_bytes()
+    assert json.loads((model_dir / "predict_report.json").read_text())["final"]["recall_pairs"]["file"] == fixed.name
+    pl.read_parquet(fixed).drop("country").write_parquet(out / "bad.parquet")
+    assert cli.main(["final", "--data", str(dataset), "--model", str(model_dir), "--out", str(out / "x"),
+                     "--recall-pairs", str(out / "bad.parquet")]) == 2
 
 
 def test_final_with_derived_lists(dataset, final_model):
@@ -450,8 +483,22 @@ def test_final_with_derived_lists(dataset, final_model):
     assert cli.main(["final", "--data", str(dataset), "--model", str(model_dir), "--out", str(out / "c"),
                      "--derive-lists"]) == 0
     report = json.loads((model_dir / "predict_report.json").read_text())
-    assert {"E_lists", "F_lists", "G_lists"} <= set(report["post"])
+    assert {"E_lists", "F_lists", "G_lists"} <= set(report["post"]) and report["final"]["derive_lists"] is True
     assert (out / "c" / "matching_results.tsv").read_text().count("\n") == (out / "a" / "matching_results.tsv").read_text().count("\n")
+
+
+def test_post_import_copies_nothing_from_a_bad_import(trained, final_model, tmp_path):
+    from src import final
+    model_dir, _ = trained
+    src, _, _ = final_model
+    copy = tmp_path / "model"
+    shutil.copytree(model_dir, copy)
+    rdir = src / final.RECALL_DIR
+    pl.DataFrame({"s1": ["x"]}).write_parquet(tmp_path / "bad.parquet")
+    assert cli.main(["post-import", "--model", str(copy), "--retriever", str(rdir / "retriever"),
+                     "--recall-encoder", str(rdir / "encoder"), "--head", str(rdir / "head.txt"),
+                     "--head-meta", str(rdir / "head.json"), "--lists", str(tmp_path / "bad.parquet")]) == 2
+    assert not (copy / final.RECALL_DIR).exists()
 
 
 def test_encoder_and_recall_head_training(dataset, final_model, tmp_path):

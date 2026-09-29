@@ -18,7 +18,7 @@ def one(fn, value):
     ("Classe Fetes Groupe S.A.R.L.", "classe fetes groupe sarl"),
     ("Cardiology Partners L.L.C.", "cardiology partners llc"),
     ("Smith & Sons Co.", "smith and sons company"),
-    ("*** Sai Tech Private Limited", "sai technologies private limited"),
+    ("*** Moti Tech Private Limited", "moti technologies private limited"),
     ("", ""),
 ])
 def test_clean_name(raw, expected):
